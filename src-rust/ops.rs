@@ -174,6 +174,19 @@ pub fn update_provider_models(
     name: &str,
     models: Vec<config::ModelEntry>,
 ) -> Result<Option<PathBuf>> {
+    // Enrich still-unparameterized entries (e.g. web UI defaults) from the opencode
+    // model catalog; entries with explicit params are left untouched.
+    let catalog = crate::models::catalog();
+    let models: Vec<config::ModelEntry> = models
+        .into_iter()
+        .map(|mut m| {
+            if crate::models::is_unparameterized(&m) {
+                catalog.enrich(&mut m);
+            }
+            m
+        })
+        .collect();
+
     let mut config = load_config()?;
     let backup = backup_config("config")?;
 
@@ -258,7 +271,17 @@ pub fn upsert_profile(
     profile: &ProviderProfile,
     rename_from: Option<&str>,
 ) -> Result<Option<PathBuf>> {
-    config::validate_provider_profile(name, profile).map_err(AppError::InvalidInput)?;
+    let mut profile = profile.clone();
+    // Enrich still-unparameterized entries (e.g. web UI defaults) from the opencode
+    // model catalog; entries with explicit params are left untouched.
+    let catalog = crate::models::catalog();
+    for model in &mut profile.models {
+        if crate::models::is_unparameterized(model) {
+            catalog.enrich(model);
+        }
+    }
+
+    config::validate_provider_profile(name, &profile).map_err(AppError::InvalidInput)?;
 
     let mut config = load_config()?;
     let backup = backup_config("config")?;

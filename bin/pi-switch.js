@@ -402,14 +402,9 @@ async function main() {
         const modelIds = rest.slice(2);
         if (modelIds.length === 0) fail("at least one model ID required");
 
-        // Convert model IDs to ModelEntryInput format
-        const models = modelIds.map(id => ({
-          id,
-          name: undefined,
-          input: ["text"],
-          contextWindow: 1000000,
-          maxTokens: 128000,
-        }));
+        // Convert model IDs to ModelEntryInput format; leave params unset so the
+        // native side fills them from the opencode model catalog (models.dev).
+        const models = modelIds.map(id => ({ id }));
 
         const result = updateProviderModels(name, models);
         console.log(result);

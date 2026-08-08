@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["full"] }
 # http proxy (matching cc-switch's axum choice)
 axum = { version = "0.7", features = ["tokio", "http1", "json"] }
 hyper = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors"] }
 
