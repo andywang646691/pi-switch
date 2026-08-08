@@ -29,10 +29,10 @@ Manage provider profiles and run a local model-name routing gateway with failove
 
 ```bash
 # npm (recommended)
-npm install -g @jackie-zheng/pi-switch
+npm install -g @andywangzzm/pi-switch
 
 # or via pi
-pi install npm:@jackie-zheng/pi-switch
+pi install npm:@andywangzzm/pi-switch
 ```
 
 **Build from source** (requires Node.js >= 20, Rust 1.80+):
@@ -57,7 +57,7 @@ node bin/pi-switch.js tui
 **Troubleshooting GLIBC errors:**
 ```bash
 # If you see "GLIBC_X.XX not found", build from source:
-npm install -g @jackie-zheng/pi-switch --build-from-source
+npm install -g @andywangzzm/pi-switch --build-from-source
 ```
 
 ---

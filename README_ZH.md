@@ -29,10 +29,10 @@
 
 ```bash
 # npm（推荐）
-npm install -g @jackie-zheng/pi-switch
+npm install -g @andywangzzm/pi-switch
 
 # 或通过 pi 安装
-pi install npm:@jackie-zheng/pi-switch
+pi install npm:@andywangzzm/pi-switch
 ```
 
 **从源码构建**（需要 Node.js >= 20, Rust 1.80+）：
@@ -57,7 +57,7 @@ node bin/pi-switch.js tui
 **GLIBC 错误排查：**
 ```bash
 # 如果看到 "GLIBC_X.XX not found" 错误，可从源码构建：
-npm install -g @jackie-zheng/pi-switch --build-from-source
+npm install -g @andywangzzm/pi-switch --build-from-source
 ```
 
 ---
