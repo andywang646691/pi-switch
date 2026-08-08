@@ -28,8 +28,17 @@ import { fileURLToPath } from "url";
 const PROJECT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 process.env.PI_SWITCH_PROJECT_DIR = PROJECT_DIR;
 
+// Give daemon processes a recognizable name in macOS/Linux process managers.
+// Normal CLI commands keep Node's default process title.
+const [processCommand, processAction] = process.argv.slice(2);
+if (processCommand === "proxy" && processAction === "start") {
+  process.title = "pi-switch-proxy";
+} else if (processCommand === "webui" && processAction === "start") {
+  process.title = "pi-switch-webui";
+}
+
 function usage() {
-  console.log(`pi-switch v0.4.5 — lightweight profile switcher for pi agent
+  console.log(`pi-switch v0.5.1 — lightweight profile switcher for pi agent
 
 Usage:
   pi-switch provider list
