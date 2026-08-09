@@ -14,16 +14,31 @@ import { DoctorPanel } from "./components/DoctorPanel";
 
 type NavKey = "home" | "profiles" | "proxy" | "packages" | "stats" | "backups" | "settings" | "doctor";
 
-const NAV: { key: NavKey; label: string; icon: string }[] = [
-  { key: "home", label: "Home", icon: "🏠" },
-  { key: "profiles", label: "Profiles", icon: "👤" },
-  { key: "proxy", label: "Proxy", icon: "🔄" },
-  { key: "packages", label: "Packages", icon: "📦" },
-  { key: "stats", label: "Stats", icon: "📊" },
-  { key: "backups", label: "Backups", icon: "💾" },
-  { key: "settings", label: "Settings", icon: "⚙️" },
-  { key: "doctor", label: "Doctor", icon: "🩺" },
+type NavIconName = "home" | "profiles" | "proxy" | "packages" | "stats" | "backups" | "settings" | "doctor";
+const NAV: { key: NavKey; label: string; icon: NavIconName }[] = [
+  { key: "home", label: "Home", icon: "home" },
+  { key: "profiles", label: "Profiles", icon: "profiles" },
+  { key: "proxy", label: "Proxy", icon: "proxy" },
+  { key: "packages", label: "Packages", icon: "packages" },
+  { key: "stats", label: "Stats", icon: "stats" },
+  { key: "backups", label: "Backups", icon: "backups" },
+  { key: "settings", label: "Settings", icon: "settings" },
+  { key: "doctor", label: "Doctor", icon: "doctor" },
 ];
+
+function NavIcon({ name }: { name: NavIconName }) {
+  const paths: Record<NavIconName, string> = {
+    home: "M3 10.5 12 3l9 7.5M5.5 9v10h13V9M9 19v-5h6v5",
+    profiles: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM4 21a8 8 0 0 1 16 0",
+    proxy: "M4 8h13M14 5l3 3-3 3M20 16H7m3-3-3 3 3 3",
+    packages: "M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9ZM4 7.5l8 4.5 8-4.5M12 12v9",
+    stats: "M5 19V9M12 19V5M19 19v-7",
+    backups: "M4 7h16M6 3h12v18H6zM9 11h6M9 15h6",
+    settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4M3 12h2M19 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M12 3v2M12 19v2",
+    doctor: "M12 3v18M3 12h18M7 7l10 10M17 7 7 17",
+  };
+  return <svg className="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
+}
 
 export interface PanelProps {
   state: AppState;
@@ -73,39 +88,54 @@ function Shell({ onConfigLang }: { onConfigLang: (lang: string | null) => void }
     await refresh();
   }, [refresh]);
 
+  const activeNav = NAV.find((item) => item.key === nav) ?? NAV[0];
+
   return (
-    <div className="flex h-full">
-      {/* Sidebar */}
-      <aside className="flex w-56 shrink-0 flex-col border-r border-white/10 bg-zinc-950/60">
-        <div className="px-4 py-4">
-          <div className="text-lg font-bold tracking-tight text-zinc-100">pi-switch</div>
-          <div className="text-[11px] text-zinc-500">{t("provider control · web")}</div>
+    <div className="app-shell flex h-full">
+      <aside className="app-sidebar flex w-60 shrink-0 flex-col">
+        <div className="brand-block px-5 pb-7 pt-6">
+          <div className="flex items-center gap-3">
+            <div className="brand-mark">π</div>
+            <div>
+              <div className="text-[15px] font-semibold tracking-tight text-white">pi-switch</div>
+              <div className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-zinc-500">{t("control plane")}</div>
+            </div>
+          </div>
         </div>
-        <nav className="flex-1 px-2">
+        <div className="px-3 pb-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-600">{t("Workspace")}</div>
+        <nav className="flex-1 px-3">
           {NAV.map((item) => (
             <button
               key={item.key}
               onClick={() => setNav(item.key)}
-              className={cx(
-                "mb-0.5 flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm",
-                nav === item.key
-                  ? "bg-indigo-600/20 text-indigo-200"
-                  : "text-zinc-400 hover:bg-white/5 hover:text-zinc-200",
-              )}
+              className={cx("nav-item mb-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm", nav === item.key && "is-active")}
             >
-              <span className="text-base">{item.icon}</span>
-              {t(item.label)}
+              <span className="nav-icon"><NavIcon name={item.icon} /></span>
+              <span>{t(item.label)}</span>
+              {nav === item.key && <span className="nav-active-dot ml-auto" />}
             </button>
           ))}
         </nav>
-        <div className="px-4 py-3 text-[11px] text-zinc-600">
-          {t("CLI · TUI · WebUI — same core")}
+        <div className="sidebar-footer mx-3 mb-4 rounded-xl px-3 py-3">
+          <div className="mb-2 flex items-center gap-2 text-[11px] text-zinc-300">
+            <span className="status-dot" />
+            {t("Core connected")}
+          </div>
+          <div className="text-[10px] leading-4 text-zinc-600">{t("CLI · TUI · WebUI — same core")}</div>
         </div>
       </aside>
 
-      {/* Main */}
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-5xl px-6 py-6">
+      <main className="app-main flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-6xl px-5 pb-10 pt-5 sm:px-8">
+          <header className="topbar mb-8 flex items-center justify-between">
+            <div>
+              <div className="text-xs font-medium uppercase tracking-[0.16em] text-zinc-500">pi-switch / {t("workspace")}</div>
+              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-white">{t(activeNav.label)}</h1>
+            </div>
+            <div className="hidden items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-3 py-1.5 text-[11px] text-zinc-400 sm:flex">
+              <span className="status-dot" /> {t("Local instance")}
+            </div>
+          </header>
           {error && (
             <div className="mb-4 rounded-lg border border-red-500/30 bg-red-950/40 px-4 py-3 text-sm text-red-200">
               <div className="font-medium">{t("Could not load config")}</div>

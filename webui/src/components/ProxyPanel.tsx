@@ -5,6 +5,13 @@ import { Badge, Button, Card, Field, Input, SectionTitle } from "./ui";
 import { useAction } from "./ui";
 import { useI18n } from "../i18n";
 
+function MoveIcon({ direction }: { direction: "up" | "down" }) {
+  return <svg className="control-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={direction === "up" ? "M8 12V4m-3 3 3-3 3 3" : "M8 4v8m-3-3 3 3 3-3"} /></svg>;
+}
+function CloseIcon() {
+  return <svg className="control-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg>;
+}
+
 export function ProxyPanel({
   state,
   refresh,
@@ -112,7 +119,7 @@ function FailoverEditor({
 
   return (
     <Card>
-      <div className="mb-1 text-sm font-semibold text-zinc-200">{t("Failover chain")}</div>
+      <div className="mb-1 flex items-center gap-2 text-sm font-semibold text-zinc-200"><span className="section-kicker" />{t("Failover chain")}</div>
       <div className="mb-3 text-xs text-zinc-500">
         {t("Same-model fallback order when the primary provider fails. Proxy profiles are excluded.")}
       </div>
@@ -124,25 +131,16 @@ function FailoverEditor({
         {chain.map((name, i) => (
           <div
             key={name}
-            className="flex items-center justify-between rounded-md border border-white/10 px-2 py-1.5 text-sm"
+            className="failover-row flex items-center justify-between rounded-xl border border-white/[0.07] bg-white/[0.018] px-3 py-2 text-sm"
           >
             <span className="text-zinc-200">
               <span className="mr-2 text-zinc-500">{i + 1}.</span>
               {name}
             </span>
             <div className="flex gap-1">
-              <button className="px-1 text-zinc-400 hover:text-zinc-100" onClick={() => move(i, -1)}>
-                ↑
-              </button>
-              <button className="px-1 text-zinc-400 hover:text-zinc-100" onClick={() => move(i, 1)}>
-                ↓
-              </button>
-              <button
-                className="px-1 text-zinc-400 hover:text-red-300"
-                onClick={() => setChain(chain.filter((x) => x !== name))}
-              >
-                ✕
-              </button>
+              <button aria-label="Move up" className="icon-button" onClick={() => move(i, -1)}><MoveIcon direction="up" /></button>
+              <button aria-label="Move down" className="icon-button" onClick={() => move(i, 1)}><MoveIcon direction="down" /></button>
+              <button aria-label="Remove" className="icon-button danger" onClick={() => setChain(chain.filter((x) => x !== name))}><CloseIcon /></button>
             </div>
           </div>
         ))}

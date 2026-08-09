@@ -35,7 +35,7 @@ export function StatsPanel(_: { state: AppState; refresh: () => Promise<void> })
   const [customTo, setCustomTo] = useState("");
   const [customError, setCustomError] = useState<string | null>(null);
   const [refreshMs, setRefreshMs] = useState<number | null>(null);
-  const [conversationsOpen, setConversationsOpen] = useState(false);
+  const [conversationsOpen, setConversationsOpen] = useState(true);
   const [requestsOpen, setRequestsOpen] = useState(true);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(50);
@@ -504,12 +504,12 @@ export function StatsPanel(_: { state: AppState; refresh: () => Promise<void> })
                 className="mb-2 flex w-full items-center justify-between text-sm font-semibold text-zinc-200"
               >
                 <span>{t("Request details")}</span>
-                <span className="text-zinc-500">{requestsOpen ? "▾" : "▸"}</span>
+                <span className="text-zinc-500"><ChevronIcon open={requestsOpen} /></span>
               </button>
               {requestsOpen && (
                 <>
                   <div className="overflow-x-auto">
-                <table aria-label={t("Request details")} className="w-full text-sm">
+                <table aria-label={t("Request details")} className="min-w-[1180px] w-full text-sm">
                   <thead className="text-left text-xs text-zinc-500">
                     <tr>
                       <th className="pb-1 pr-2">{t("Time")}</th>
@@ -607,7 +607,7 @@ export function StatsPanel(_: { state: AppState; refresh: () => Promise<void> })
               className="mb-2 flex w-full items-center justify-between text-sm font-semibold text-zinc-200"
             >
               <span>{t("By conversation")}</span>
-              <span className="text-zinc-500">{conversationsOpen ? "▾" : "▸"}</span>
+              <span className="text-zinc-500"><ChevronIcon open={conversationsOpen} /></span>
             </button>
             {conversationsOpen && (
               <div>
@@ -664,7 +664,7 @@ export function StatsPanel(_: { state: AppState; refresh: () => Promise<void> })
                                     onClick={() => toggleConv(c.conversationId)}
                                     className="text-zinc-500 hover:text-zinc-200"
                                   >
-                                    {expandedConvs.has(c.conversationId) ? "▾" : "▸"}
+                                    <ChevronIcon open={expandedConvs.has(c.conversationId)} />
                                   </button>
                                 </td>
                                 <td className="py-1 pr-2 whitespace-nowrap text-zinc-500">
@@ -817,6 +817,10 @@ function pageNumbers(current: number, total: number): (number | "…")[] {
   return out;
 }
 
+function ChevronIcon({ open }: { open: boolean }) {
+  return <svg className={`chevron-icon ${open ? "is-open" : ""}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg>;
+}
+
 function formatRouteEvent(
   event: string | null | undefined,
   t: (key: string) => string,
@@ -870,7 +874,7 @@ function RequestRow({ r, i }: { r: RecentRequest; i: number }) {
         <CopyableSessionCell id={r.conversationId} name={r.conversationName} />
       </td>
       <td className="py-1 pr-2 text-zinc-300">{r.provider ?? "-"}</td>
-      <td className="py-1 pr-2 text-zinc-300">{r.model ?? "-"}</td>
+      <td className="model-cell py-1 pr-2 font-mono text-xs text-zinc-300">{r.model ?? "-"}</td>
       <td className="py-1 pr-2 text-zinc-400">
         <span className="block max-w-[14rem] truncate" title={status}>
           {status}
@@ -906,8 +910,8 @@ function CopyableSessionCell({
   return (
     <button
       type="button"
-      title={id ?? undefined}
-      aria-label={id ? `Copy conversation ${id}` : undefined}
+      title={display === "-" ? undefined : display}
+      aria-label={id ? `Copy conversation ${display}` : undefined}
       onClick={() => {
         if (!id) return;
         navigator.clipboard
@@ -918,7 +922,7 @@ function CopyableSessionCell({
           })
           .catch(() => {});
       }}
-      className={`block max-w-[12rem] truncate text-left text-zinc-300 hover:text-zinc-100 ${className}`}
+      className={`session-cell block max-w-[15rem] truncate text-left text-zinc-300 hover:text-white ${className}`}
     >
       {copied ? "✓" : display}
     </button>
@@ -985,7 +989,7 @@ function ExpandedConversationRequests({ conv }: { conv: ConversationStats }) {
       ) : (
         <>
           <div className="overflow-x-auto">
-            <table aria-label={`Requests of ${conv.conversationId}`} className="w-full text-sm">
+            <table aria-label={`Requests of ${conv.conversationId}`} className="min-w-[1180px] w-full text-sm">
               <thead className="text-left text-xs text-zinc-500">
                 <tr>
                   <th className="pb-1 pr-2">{t("Time")}</th>

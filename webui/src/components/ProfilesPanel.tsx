@@ -46,6 +46,8 @@ export function ProfilesPanel({
   const [editing, setEditing] = useState<{ name: string | null } | null>(null);
   const [models, setModels] = useState<string | null>(null); // profile name for models modal
   const [ccImport, setCcImport] = useState(false);
+  const [testing, setTesting] = useState<Record<string, boolean>>({});
+  const [testResults, setTestResults] = useState<Record<string, { success: boolean; message: string; responseTimeMs?: number }>>({});
 
   const entries = Object.entries(state.profiles).sort(([a], [b]) => a.localeCompare(b));
 
@@ -84,6 +86,14 @@ export function ProfilesPanel({
                 </div>
                 <div className="mt-0.5 truncate text-xs text-zinc-500">
                   {p.baseUrl || t("no base url")} · {p.models?.length ?? 0} {t("models")}
+                  {testResults[name] && (
+                    <div className={`mt-2 flex items-center gap-2 text-xs ${testResults[name].success ? "text-emerald-300" : "text-red-300"}`}>
+                      <span className={`result-dot ${testResults[name].success ? "is-success" : "is-error"}`} />
+                      <span>{testResults[name].success ? t("Reachable") : t("Connection failed")}</span>
+                      {testResults[name].responseTimeMs != null && <span className="text-zinc-600">{testResults[name].responseTimeMs}ms</span>}
+                      {!testResults[name].success && <span className="max-w-[24rem] truncate text-red-300/70" title={testResults[name].message}>{testResults[name].message}</span>}
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
@@ -99,18 +109,24 @@ export function ProfilesPanel({
                 <Button onClick={() => setModels(name)}>{t("Models")}</Button>
                 <Button onClick={() => setEditing({ name })}>{t("Edit")}</Button>
                 <Button
-                  onClick={() =>
-                    run(
-                      async () => {
-                        const r = await api.testProfile(name);
-                        if (!r.success) throw new Error(r.message);
-                        return r;
-                      },
-                      t("Test OK"),
-                    )
-                  }
+                  disabled={testing[name]}
+                  onClick={async () => {
+                    setTesting((current) => ({ ...current, [name]: true }));
+                    setTestResults((current) => { const next = { ...current }; delete next[name]; return next; });
+                    try {
+                      const result = await api.testProfile(name);
+                      setTestResults((current) => ({ ...current, [name]: result }));
+                    } catch (e) {
+                      setTestResults((current) => ({
+                        ...current,
+                        [name]: { success: false, message: e instanceof Error ? e.message : String(e) },
+                      }));
+                    } finally {
+                      setTesting((current) => ({ ...current, [name]: false }));
+                    }
+                  }}
                 >
-                  {t("Test")}
+                  {testing[name] ? <><span className="button-spinner" />{t("Testing…")}</> : t("Test")}
                 </Button>
                 <Button
                   onClick={() => {

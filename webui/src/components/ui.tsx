@@ -8,10 +8,10 @@ export function cx(...parts: Array<string | false | null | undefined>): string {
 
 type BtnVariant = "primary" | "ghost" | "danger" | "subtle";
 const BTN: Record<BtnVariant, string> = {
-  primary: "bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500",
-  danger: "bg-red-600/90 hover:bg-red-500 text-white border-red-500",
+  primary: "bg-indigo-500 hover:bg-indigo-400 text-white border-indigo-400/70 shadow-lg shadow-indigo-950/30",
+  danger: "bg-red-500/90 hover:bg-red-400 text-white border-red-400/70",
   ghost: "bg-transparent hover:bg-white/5 text-zinc-200 border-white/10",
-  subtle: "bg-white/5 hover:bg-white/10 text-zinc-200 border-white/10",
+  subtle: "bg-white/[0.045] hover:bg-white/[0.085] text-zinc-200 border-white/10",
 };
 
 export function Button({
@@ -23,8 +23,8 @@ export function Button({
     <button
       {...props}
       className={cx(
-        "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium",
-        "transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+        "inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium",
+        "transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed active:scale-[0.98]",
         BTN[variant],
         className,
       )}
@@ -44,7 +44,7 @@ export function Card({
   children: React.ReactNode;
 }) {
   return (
-    <div style={style} className={cx("rounded-xl border border-white/10 bg-zinc-900/50 p-4", className)}>
+    <div style={style} className={cx("rounded-2xl border border-white/[0.085] bg-white/[0.028] p-5 shadow-[0_12px_40px_rgba(0,0,0,0.12)]", className)}>
       {children}
     </div>
   );
@@ -52,8 +52,8 @@ export function Card({
 
 export function SectionTitle({ children, hint }: { children: React.ReactNode; hint?: string }) {
   return (
-    <div className="mb-3 flex items-baseline justify-between">
-      <h2 className="text-lg font-semibold text-zinc-100">{children}</h2>
+    <div className="mb-4 flex items-baseline justify-between">
+      <h2 className="text-lg font-semibold tracking-tight text-zinc-100">{children}</h2>
       {hint && <span className="text-xs text-zinc-500">{hint}</span>}
     </div>
   );
@@ -66,7 +66,7 @@ export function Label({ children }: { children: React.ReactNode }) {
 }
 
 const CTRL =
-  "w-full rounded-md border border-white/10 bg-zinc-950/60 px-3 py-1.5 text-sm text-zinc-100 " +
+  "w-full rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-sm text-zinc-100 "
   "outline-none focus:border-indigo-500/70 placeholder:text-zinc-600";
 
 export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
