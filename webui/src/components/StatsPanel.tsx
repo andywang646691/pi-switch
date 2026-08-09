@@ -517,6 +517,7 @@ export function StatsPanel(_: { state: AppState; refresh: () => Promise<void> })
                       <th className="pb-1 pr-2">{t("Provider")}</th>
                       <th className="pb-1 pr-2">{t("Model")}</th>
                       <th className="pb-1 pr-2">{t("Status")}</th>
+                      <th className="pb-1 pr-2">{t("Routing")}</th>
                       <th className="pb-1 pr-2 text-right">{t("Input")}</th>
                       <th className="pb-1 pr-2 text-right">{t("Output")}</th>
                       <th className="pb-1 pr-2 text-right">{t("Cached")}</th>
@@ -816,6 +817,26 @@ function pageNumbers(current: number, total: number): (number | "…")[] {
   return out;
 }
 
+function formatRouteEvent(
+  event: string | null | undefined,
+  t: (key: string) => string,
+): { label: string; title: string; tone: string } {
+  switch (event) {
+    case "fallback_success":
+      return { label: t("Failover succeeded"), title: t("Failover succeeded"), tone: "text-amber-300" };
+    case "recovered":
+      return { label: t("Recovered to primary"), title: t("Recovered to primary"), tone: "text-emerald-300" };
+    case "attempt_failed":
+      return { label: t("Upstream failed"), title: t("Upstream failed"), tone: "text-red-300" };
+    case "circuit_skipped":
+      return { label: t("Circuit skipped"), title: t("Circuit skipped"), tone: "text-zinc-500" };
+    case "primary_success":
+      return { label: t("Primary"), title: t("Primary"), tone: "text-zinc-400" };
+    default:
+      return { label: "-", title: "", tone: "text-zinc-500" };
+  }
+}
+
 function formatRequestStatus(r: RecentRequest): string {
   if (r.ok) {
     return r.status != null ? String(r.status) : "ok";
@@ -828,7 +849,9 @@ function formatRequestStatus(r: RecentRequest): string {
 // ─── conversation browser so both render identically) ─────────
 
 function RequestRow({ r, i }: { r: RecentRequest; i: number }) {
+  const { t } = useI18n();
   const status = formatRequestStatus(r);
+  const routing = formatRouteEvent(r.routeEvent, t);
   const tokenCols = [
     ["Input", formatRequestToken(r.promptTokens)],
     ["Output", formatRequestToken(r.completionTokens)],
@@ -852,6 +875,9 @@ function RequestRow({ r, i }: { r: RecentRequest; i: number }) {
         <span className="block max-w-[14rem] truncate" title={status}>
           {status}
         </span>
+      </td>
+      <td className={`py-1 pr-2 whitespace-nowrap ${routing.tone}`} title={routing.title}>
+        {routing.label}
       </td>
       {tokenCols.map(([label, value, tone]) => (
         <td key={label} className={`py-1 pr-2 text-right ${tone ?? "text-zinc-400"}`}>
@@ -967,6 +993,7 @@ function ExpandedConversationRequests({ conv }: { conv: ConversationStats }) {
                   <th className="pb-1 pr-2">{t("Provider")}</th>
                   <th className="pb-1 pr-2">{t("Model")}</th>
                   <th className="pb-1 pr-2">{t("Status")}</th>
+                  <th className="pb-1 pr-2">{t("Routing")}</th>
                   <th className="pb-1 pr-2 text-right">{t("Input")}</th>
                   <th className="pb-1 pr-2 text-right">{t("Output")}</th>
                   <th className="pb-1 pr-2 text-right">{t("Cached")}</th>

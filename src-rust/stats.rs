@@ -29,6 +29,8 @@ pub struct RequestLogEntry {
     /// Conversation display name (header-only, ADR-0002 display attribute).
     #[serde(rename = "conversationName", default)]
     pub conversation_name: Option<String>,
+    #[serde(rename = "routeEvent", default)]
+    pub route_event: Option<String>,
     #[serde(rename = "costTotal", default)]
     pub cost_total: Option<f64>,
 }
@@ -137,6 +139,8 @@ pub struct RecentRequest {
     pub conversation_id: Option<String>,
     #[serde(rename = "conversationName", default)]
     pub conversation_name: Option<String>,
+    #[serde(rename = "routeEvent", default)]
+    pub route_event: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,6 +408,7 @@ fn request_detail(entry: &RequestLogEntry) -> RecentRequest {
         cost: entry.cost_total,
         conversation_id: entry.conversation_id.clone(),
         conversation_name: entry.conversation_name.clone(),
+        route_event: entry.route_event.clone(),
     };
     if let Some(u) = usage_of(entry) {
         detail.prompt_tokens = Some(u.prompt);
@@ -891,12 +896,12 @@ pub fn export_logs_json() -> crate::error::Result<String> {
 
 fn csv_of(entries: &[RequestLogEntry]) -> String {
     let mut csv = String::from(
-        "timestamp,ok,provider,model,status,latency_ms,error,retry,skipped,converted,upstream_url,promptTokens,completionTokens,cachedTokens,reasoningTokens,conversationId,costTotal\n",
+        "timestamp,ok,provider,model,status,latency_ms,error,retry,skipped,converted,upstream_url,promptTokens,completionTokens,cachedTokens,reasoningTokens,conversationId,routeEvent,costTotal\n",
     );
 
     for entry in entries {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             entry.ts.as_deref().unwrap_or(""),
             entry
                 .ok
@@ -944,6 +949,7 @@ fn csv_of(entries: &[RequestLogEntry]) -> String {
                 .unwrap_or("")
                 .replace(',', ";")
                 .replace('\n', " "),
+            entry.route_event.as_deref().unwrap_or(""),
             entry.cost_total.map(|c| c.to_string()).unwrap_or_default(),
         ));
     }
@@ -978,6 +984,7 @@ mod tests {
             reasoning_tokens: None,
             conversation_id: None,
             conversation_name: None,
+            route_event: None,
             cost_total: None,
         }
     }
@@ -1980,12 +1987,12 @@ mod tests {
         let header = lines.next().unwrap();
         assert!(
             header.ends_with(
-                "upstream_url,promptTokens,completionTokens,cachedTokens,reasoningTokens,conversationId,costTotal"
+                "upstream_url,promptTokens,completionTokens,cachedTokens,reasoningTokens,conversationId,routeEvent,costTotal"
             ),
             "header: {header}"
         );
         let row = lines.next().unwrap();
-        assert!(row.ends_with(",100,50,40,20,conv-9,"), "row: {row}");
+        assert!(row.ends_with(",100,50,40,20,conv-9,,"), "row: {row}");
         assert!(lines.next().is_none(), "exactly one data row");
     }
 
@@ -1995,7 +2002,7 @@ mod tests {
         e.conversation_id = Some("a,b\nc".into());
         let csv = csv_of(&[e]);
         let row = csv.lines().nth(1).unwrap();
-        assert!(row.ends_with(",,,,a;b c,"), "got: {row}");
+        assert!(row.ends_with(",,,,a;b c,,"), "got: {row}");
     }
     #[test]
     fn json_export_serializes_token_and_conversation_fields() {

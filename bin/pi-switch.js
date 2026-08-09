@@ -38,7 +38,7 @@ if (processCommand === "proxy" && processAction === "start") {
 }
 
 function usage() {
-  console.log(`pi-switch v0.5.1 — lightweight profile switcher for pi agent
+  console.log(`pi-switch v0.5.2 — lightweight profile switcher for pi agent
 
 Usage:
   pi-switch provider list

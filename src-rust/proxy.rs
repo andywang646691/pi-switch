@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ─── Disguise: preset → real client identity ───────────────
 //
@@ -111,6 +111,85 @@ pub struct CircuitEntry {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct CircuitStateStore {
     pub providers: std::collections::HashMap<String, CircuitEntry>,
+}
+
+/// Per-request routing trace. It is scoped to the async request task so every
+/// attempt log can explain whether it was a primary request, a fallback, or a
+/// half-open recovery probe.
+#[derive(Debug)]
+struct RouteTrace {
+    candidates: Vec<String>,
+    attempted: Vec<String>,
+    half_open_provider: Option<String>,
+}
+
+impl RouteTrace {
+    fn new(candidates: Vec<String>) -> Self {
+        Self {
+            candidates,
+            attempted: Vec::new(),
+            half_open_provider: None,
+        }
+    }
+}
+
+tokio::task_local! {
+    static ROUTE_TRACE: Arc<Mutex<RouteTrace>>;
+}
+
+fn route_mark_attempt(provider: &str, half_open: bool) {
+    let _ = ROUTE_TRACE.try_with(|trace| {
+        let mut trace = trace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if half_open {
+            trace.half_open_provider = Some(provider.to_string());
+        }
+    });
+}
+
+/// Observe one logged attempt and return a human-readable machine-stable event.
+fn route_observe(provider: &str, ok: bool, error: Option<&str>) -> Option<String> {
+    ROUTE_TRACE
+        .try_with(|trace| {
+            let mut trace = trace
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if error == Some("circuit_open") || error == Some("half_open_already_probing") {
+                return Some("circuit_skipped".to_string());
+            }
+            if !trace.attempted.iter().any(|name| name == provider) {
+                trace.attempted.push(provider.to_string());
+            }
+            if ok {
+                if trace.half_open_provider.as_deref() == Some(provider) {
+                    Some("recovered".to_string())
+                } else if trace.attempted.len() > 1
+                    || trace
+                        .candidates
+                        .first()
+                        .is_some_and(|first| first != provider)
+                {
+                    Some("fallback_success".to_string())
+                } else {
+                    Some("primary_success".to_string())
+                }
+            } else {
+                Some("attempt_failed".to_string())
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+fn route_scope<T>(
+    candidates: Vec<String>,
+    future: T,
+) -> impl std::future::Future<Output = T::Output>
+where
+    T: std::future::Future,
+{
+    ROUTE_TRACE.scope(Arc::new(Mutex::new(RouteTrace::new(candidates))), future)
 }
 
 // ─── Circuit breaker ──────────────────────────────────────
@@ -533,15 +612,18 @@ async fn handle_chat_completions(
 
     let conversation_id = conversation_id_of(&headers, &body_value);
 
-    let result = forward_with_failover(
-        &config,
-        &candidates,
-        &body_value,
-        &real_model,
-        "chat/completions",
-        &headers,
-        conversation_id.as_deref(),
-        true,
+    let result = route_scope(
+        candidates.clone(),
+        forward_with_failover(
+            &config,
+            &candidates,
+            &body_value,
+            &real_model,
+            "chat/completions",
+            &headers,
+            conversation_id.as_deref(),
+            true,
+        ),
     )
     .await;
 
@@ -591,13 +673,16 @@ async fn handle_messages(
 
     let conversation_id = conversation_id_of(&headers, &body_value);
 
-    let result = forward_anthropic_with_failover(
-        &config,
-        &candidates,
-        &body_value,
-        &real_model,
-        &headers,
-        conversation_id.as_deref(),
+    let result = route_scope(
+        candidates.clone(),
+        forward_anthropic_with_failover(
+            &config,
+            &candidates,
+            &body_value,
+            &real_model,
+            &headers,
+            conversation_id.as_deref(),
+        ),
     )
     .await;
 
@@ -1435,13 +1520,16 @@ async fn handle_responses_with_config(
                 Json(json!({ "error": { "message": format!("No upstream exposes model '{}'", requested_model), "type": "no_route" } }))).into_response();
         }
         let conversation_id = conversation_id_of(&headers, &body_value);
-        let result = forward_responses_mixed(
-            config,
-            &candidates,
-            &body_value,
-            &real_model,
-            &headers,
-            conversation_id.as_deref(),
+        let result = route_scope(
+            candidates.clone(),
+            forward_responses_mixed(
+                config,
+                &candidates,
+                &body_value,
+                &real_model,
+                &headers,
+                conversation_id.as_deref(),
+            ),
         )
         .await;
         match result {
@@ -1465,13 +1553,16 @@ async fn handle_responses_with_config(
             return (StatusCode::NOT_IMPLEMENTED,
                 Json(json!({ "error": { "message": "Responses stream requires an openai-responses or openai-completions upstream", "type": "not_supported" } }))).into_response();
         }
-        let result = forward_responses_mixed_stream(
-            config,
-            &candidates,
-            &body_value,
-            &real_model,
-            &headers,
-            conversation_id.as_deref(),
+        let result = route_scope(
+            candidates.clone(),
+            forward_responses_mixed_stream(
+                config,
+                &candidates,
+                &body_value,
+                &real_model,
+                &headers,
+                conversation_id.as_deref(),
+            ),
         )
         .await;
         match result {
@@ -1753,6 +1844,9 @@ struct StreamLogFields {
     /// The model's unit prices at request time (per-request config reload);
     /// `None` means the model has no configured price → cost is unknown.
     cost: Option<crate::config::ModelCost>,
+    /// Routing event for the attempt: primary_success, attempt_failed,
+    /// fallback_success, recovered, or circuit_skipped.
+    route_event: Option<String>,
 }
 
 impl StreamLogFields {
@@ -1775,6 +1869,7 @@ impl StreamLogFields {
             conversation_id: conversation_id.map(|s| s.to_string()),
             conversation_name: conversation_name.map(|s| s.to_string()),
             cost: None,
+            route_event: route_observe(provider, true, None),
         }
     }
 }
@@ -1973,6 +2068,7 @@ async fn forward_responses_mixed(
 
     for name in candidates {
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        route_mark_attempt(name, is_half_open);
         if is_open {
             log_failed_attempt(
                 name,
@@ -2228,6 +2324,7 @@ async fn forward_responses_mixed_stream(
 
     for name in candidates {
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        route_mark_attempt(name, is_half_open);
         if is_open {
             log_failed_attempt(
                 name,
@@ -2465,6 +2562,7 @@ async fn forward_with_failover(
         };
 
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        route_mark_attempt(name, is_half_open);
 
         if is_open {
             log_request(
@@ -2765,6 +2863,7 @@ async fn forward_anthropic_with_failover(
 
     for name in candidates {
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        route_mark_attempt(name, is_half_open);
 
         if is_open {
             continue;
@@ -2934,6 +3033,7 @@ fn build_log_entry(fields: &StreamLogFields, usage: Option<&crate::usage::UsageS
         "reasoningTokens": usage.map(|u| u.reasoning_tokens),
         "conversationId": fields.conversation_id,
         "conversationName": fields.conversation_name,
+        "routeEvent": fields.route_event,
         "costTotal": cost_total,
     })
 }
@@ -2990,6 +3090,7 @@ async fn log_request(
         conversation_id: conversation_id.map(|s| s.to_string()),
         conversation_name: conversation_name.map(|s| s.to_string()),
         cost,
+        route_event: route_observe(provider, ok, error),
     };
     let entry = build_log_entry(&fields, usage.as_ref());
     append_log_line(&entry);
@@ -5071,6 +5172,7 @@ mod tests {
             conversation_id: Some("conv-1".to_string()),
             conversation_name: None,
             cost: None,
+            route_event: None,
         };
         let entry = super::build_log_entry(&fields, Some(&usage));
         assert!(entry.get("ts").and_then(|v| v.as_str()).is_some());
@@ -5098,6 +5200,7 @@ mod tests {
             conversation_id: Some("conv-1".to_string()),
             conversation_name: Some("my-chat".to_string()),
             cost: None,
+            route_event: None,
         };
         let entry = super::build_log_entry(&fields, None);
         assert_eq!(entry["conversationName"], "my-chat");
@@ -5122,6 +5225,7 @@ mod tests {
             conversation_id: None,
             conversation_name: None,
             cost: None,
+            route_event: None,
         };
         let entry = super::build_log_entry(&fields, None);
         assert_eq!(entry["ok"], false);
@@ -5184,6 +5288,7 @@ mod tests {
             conversation_id: Some("conv-1".to_string()),
             conversation_name: None,
             cost: Some(cost),
+            route_event: None,
         };
         let entry = super::build_log_entry(&fields, Some(&usage));
         assert_eq!(
@@ -5210,6 +5315,7 @@ mod tests {
             conversation_id: None,
             conversation_name: None,
             cost: None,
+            route_event: None,
         };
         let entry = super::build_log_entry(&fields, Some(&usage));
         assert_eq!(

@@ -192,6 +192,7 @@ export interface RecentRequest {
   cost?: number | null;
   conversationId?: string | null;
   conversationName?: string | null;
+  routeEvent?: string | null;
 }
 
 export interface ModelStats {
