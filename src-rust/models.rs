@@ -212,13 +212,49 @@ impl ModelCatalog {
 }
 
 /// pi-switch's generic placeholder signature — entries that still look like this are
-/// treated as "unparameterized" and eligible for catalog enrichment.
+/// treated as "unparameterized" and eligible for catalog enrichment. Only used by
+/// tests now that `enrich_entry` covers the same case for all write paths.
+#[cfg(test)]
 pub fn is_unparameterized(entry: &ModelEntry) -> bool {
+    has_default_window(entry) && entry.cost.is_none()
+}
+
+/// Whether the entry still carries pi-switch's default window signature
+/// (contextWindow 128000 / maxTokens 16384 / input ["text"]). Entries matching
+/// this came from an unparameterized source (e.g. the web UI's default model
+/// shape) rather than explicit user values, so catalog values should win.
+pub fn has_default_window(entry: &ModelEntry) -> bool {
     entry.input.len() == 1
         && entry.input[0] == "text"
         && entry.context_window == 128000
         && entry.max_tokens == 16384
-        && entry.cost.is_none()
+}
+
+/// Enrich one model entry from the opencode catalog, aligning every write path
+/// with the CLI's 0/empty sentinel behaviour: entries still carrying the default
+/// window signature are reset so catalog values fill context window, max output
+/// tokens and input modalities too (not just cost/name/reasoning). Explicit
+/// non-default values always win and are left untouched.
+pub fn enrich_entry(entry: &mut ModelEntry) {
+    enrich_entry_with(entry, catalog());
+}
+
+fn enrich_entry_with(entry: &mut ModelEntry, catalog: &ModelCatalog) {
+    if has_default_window(entry) {
+        entry.context_window = 0;
+        entry.max_tokens = 0;
+        entry.input.clear();
+    }
+    catalog.enrich(entry);
+    if entry.input.is_empty() {
+        entry.input = vec!["text".to_string()];
+    }
+    if entry.context_window == 0 {
+        entry.context_window = 128000;
+    }
+    if entry.max_tokens == 0 {
+        entry.max_tokens = 16384;
+    }
 }
 
 fn file_age(path: &Path) -> Option<Duration> {
@@ -356,6 +392,43 @@ mod tests {
         assert_eq!(entry.max_tokens, 0);
         assert_eq!(entry.input, vec!["text", "image"]);
         assert_eq!(entry.cost.expect("cost").input, 5.0);
+    }
+
+    #[test]
+    fn enrich_entry_with_fills_default_window_from_catalog() {
+        let catalog = catalog_with(sample_db());
+        // Web UI default shape: 128000/16384/["text"] with cost already filled by an
+        // earlier enrich pass — context/maxTokens/input must still be upgraded from
+        // the catalog, matching the CLI path.
+        let mut entry = ModelEntry {
+            id: "gpt-5.6-luna".into(),
+            input: vec!["text".into()],
+            context_window: 128000,
+            max_tokens: 16384,
+            cost: Some(ModelCost::default()),
+            ..Default::default()
+        };
+        super::enrich_entry_with(&mut entry, &catalog);
+        assert_eq!(entry.context_window, 1050000);
+        assert_eq!(entry.max_tokens, 128000);
+        assert_eq!(entry.input, vec!["text", "image"]);
+        // Cost was already set — untouched by enrich.
+        assert!(entry.cost.is_some());
+    }
+
+    #[test]
+    fn enrich_entry_with_keeps_explicit_non_default_values() {
+        let catalog = catalog_with(sample_db());
+        let mut entry = ModelEntry {
+            id: "gpt-5.6-luna".into(),
+            input: vec!["text".into()],
+            context_window: 200000,
+            max_tokens: 8192,
+            ..Default::default()
+        };
+        super::enrich_entry_with(&mut entry, &catalog);
+        assert_eq!(entry.context_window, 200000);
+        assert_eq!(entry.max_tokens, 8192);
     }
 
     #[test]

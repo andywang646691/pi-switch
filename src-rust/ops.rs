@@ -165,15 +165,12 @@ pub fn update_provider_models(
     name: &str,
     models: Vec<config::ModelEntry>,
 ) -> Result<Option<PathBuf>> {
-    // Enrich still-unparameterized entries (e.g. web UI defaults) from the opencode
-    // model catalog; entries with explicit params are left untouched.
-    let catalog = crate::models::catalog();
+    // Enrich entries that may still carry the default window signature (e.g. web UI
+    // defaults) from the opencode model catalog; explicit params are left untouched.
     let models: Vec<config::ModelEntry> = models
         .into_iter()
         .map(|mut m| {
-            if crate::models::is_unparameterized(&m) {
-                catalog.enrich(&mut m);
-            }
+            crate::models::enrich_entry(&mut m);
             m
         })
         .collect();
@@ -208,13 +205,10 @@ pub fn upsert_profile(
     rename_from: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let mut profile = profile.clone();
-    // Enrich still-unparameterized entries (e.g. web UI defaults) from the opencode
-    // model catalog; entries with explicit params are left untouched.
-    let catalog = crate::models::catalog();
+    // Enrich entries that may still carry the default window signature (e.g. web UI
+    // defaults) from the opencode model catalog; explicit params are left untouched.
     for model in &mut profile.models {
-        if crate::models::is_unparameterized(model) {
-            catalog.enrich(model);
-        }
+        crate::models::enrich_entry(model);
     }
 
     config::validate_provider_profile(name, &profile).map_err(AppError::InvalidInput)?;
