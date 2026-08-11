@@ -351,6 +351,21 @@ fn should_retry(status: u16) -> bool {
 
 // ─── OpenAI <-> Anthropic conversion ──────────────────────
 
+/// Console Go (opencode.ai) rejects OpenAI's `developer` role. Rewrite those messages
+/// to `system` before forwarding, as a safety net for any client that does not honor
+/// the `supportsDeveloperRole: false` capability advertised in pi's models.json.
+fn normalize_developer_role(body: &Value) -> Value {
+    let mut b = body.clone();
+    if let Some(messages) = b.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages {
+            if msg.get("role").and_then(Value::as_str) == Some("developer") {
+                msg["role"] = serde_json::json!("system");
+            }
+        }
+    }
+    b
+}
+
 fn openai_to_anthropic_body(body: &Value) -> Value {
     let model = body
         .get("model")
@@ -2731,6 +2746,13 @@ async fn forward_with_failover(
         } else {
             // OpenAI-compatible
             let url = format!("{}/{}", profile.base_url.trim_end_matches('/'), target_path);
+            // Console Go (opencode.ai) rejects the `developer` role; rewrite for any
+            // client that still sends it (see `normalize_developer_role`).
+            let send_body = if crate::config::is_opencode_upstream(&profile) {
+                normalize_developer_role(body)
+            } else {
+                body.clone()
+            };
 
             let mut req = client
                 .post(&url)
@@ -2741,7 +2763,7 @@ async fn forward_with_failover(
             for (k, v) in &disguise {
                 req = req.header(*k, *v);
             }
-            let resp = req.json(body).send().await;
+            let resp = req.json(&send_body).send().await;
 
             match resp {
                 Ok(r) => {
@@ -3099,7 +3121,8 @@ async fn log_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_private_params, handle_responses_with_config, make_router, resolve_route, ProxyState,
+        filter_private_params, handle_responses_with_config, make_router, normalize_developer_role,
+        resolve_route, ProxyState,
     };
     use crate::config::PiSwitchConfig;
     use axum::{
@@ -5738,5 +5761,40 @@ mod tests {
             super::lookup_model_cost(&profile, "missing").is_none(),
             "unknown model means unknown"
         );
+    }
+
+    #[test]
+    fn normalize_developer_role_rewrites_all_developer_messages() {
+        let body = serde_json::json!({
+            "model": "opencode/deepseek-v4-pro",
+            "messages": [
+                { "role": "developer", "content": "system prompt" },
+                { "role": "user", "content": "hello" },
+                { "role": "developer", "content": "extra instructions" }
+            ]
+        });
+        let out = normalize_developer_role(&body);
+        let roles: Vec<&str> = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["system", "user", "system"]);
+        assert_eq!(out["model"], "opencode/deepseek-v4-pro");
+    }
+
+    #[test]
+    fn normalize_developer_role_leaves_other_bodies_untouched() {
+        let body = serde_json::json!({
+            "model": "model-a",
+            "messages": [
+                { "role": "system", "content": "hi" },
+                { "role": "user", "content": "yo" }
+            ]
+        });
+        assert_eq!(normalize_developer_role(&body), body);
+        let no_messages = serde_json::json!({ "model": "model-a" });
+        assert_eq!(normalize_developer_role(&no_messages), no_messages);
     }
 }

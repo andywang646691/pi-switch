@@ -384,6 +384,16 @@ pub fn provider_id_for(config: &PiSwitchConfig, name: &str) -> String {
     format!("{}-{}", config.settings.provider_prefix, name)
 }
 
+/// Whether a profile routes to an opencode.ai upstream (Console Go). Console Go's chat
+/// completions schema only accepts the roles `system`, `user`, `assistant`, `tool` and
+/// `latest_reminder` — not OpenAI's `developer` role. pi only auto-detects opencode when
+/// the provider id or baseUrl literally contains "opencode", so gateway models pointing
+/// at these upstreams must advertise the capability explicitly (and the proxy should
+/// rewrite `developer` messages defensively).
+pub fn is_opencode_upstream(profile: &ProviderProfile) -> bool {
+    profile.base_url.to_lowercase().contains("opencode.ai")
+}
+
 // ─── Validation ───────────────────────────────────────────
 
 pub const SUPPORTED_APIS: [&str; 4] = [

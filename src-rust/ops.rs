@@ -502,6 +502,24 @@ pub fn sync_gateway_to_pi() -> Result<()> {
                     ..Default::default()
                 });
             entry.id = format!("{}/{}", name, real_id);
+            // Console Go (opencode.ai) rejects OpenAI's `developer` role. pi only
+            // auto-detects that for providers/baseUrls literally named opencode, so
+            // advertise the capability explicitly and pi sends `system` instead.
+            if config::is_opencode_upstream(&profile) {
+                let mut compat = entry
+                    .compat
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = compat.as_object_mut() {
+                    if !obj.contains_key("supportsDeveloperRole") {
+                        obj.insert(
+                            "supportsDeveloperRole".into(),
+                            serde_json::json!(false),
+                        );
+                    }
+                }
+                entry.compat = Some(compat);
+            }
             if let Ok(v) = serde_json::to_value(&entry) {
                 gateway_models.push(v);
             }
