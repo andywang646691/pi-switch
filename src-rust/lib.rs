@@ -581,17 +581,22 @@ pub fn set_proxy_target(target: String) -> napi::Result<String> {
 }
 
 #[napi]
-pub fn set_proxy_failover(failover_profiles: Vec<String>) -> napi::Result<String> {
-    let joined = failover_profiles.join(" → ");
-    let empty = failover_profiles.is_empty();
+pub fn set_proxy_rules(
+    rules: Vec<serde_json::Value>,
+) -> napi::Result<String> {
+    let parsed: Vec<crate::config::FailoverRule> = rules
+        .into_iter()
+        .map(|v| serde_json::from_value(v).map_err(|e| napi::Error::from_reason(e.to_string())))
+        .collect::<napi::Result<Vec<_>>>()?;
+    let count = parsed.len();
+    let empty = parsed.is_empty();
 
-    let backup = ops::set_failover(failover_profiles)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    let backup = ops::set_rules(parsed).map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     let mut msg = if empty {
-        "Failover chain cleared".to_string()
+        "Failover rules cleared".to_string()
     } else {
-        format!("Failover chain set: {}", joined)
+        format!("Failover rules set: {} rule(s)", count)
     };
 
     if let Some(path) = backup {

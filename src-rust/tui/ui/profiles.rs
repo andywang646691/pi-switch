@@ -105,13 +105,13 @@ pub(super) fn render_profiles(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let rows = visible.iter().map(|row| {
         // Marker: * for in failover chain, space otherwise
-        let marker = if row.in_failover_chain { " * " } else { "   " };
+        let marker = if row.in_rules { " * " } else { "   " };
 
         // Row color: red if circuit breaker is open (any profile),
         // green if in failover chain and healthy, default otherwise.
         let row_color = if row.circuit_breaker_open {
             Some(theme.err)
-        } else if row.in_failover_chain {
+        } else if row.in_rules {
             Some(theme.ok)
         } else {
             None

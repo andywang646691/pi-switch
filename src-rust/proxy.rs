@@ -84,7 +84,7 @@ pub struct ProxyHealth {
     pub base_url: String,
     #[serde(rename = "supportedApis")]
     pub supported_apis: Vec<String>,
-    pub failover: Vec<String>,
+    pub rules: Vec<crate::config::FailoverRule>,
     #[serde(rename = "circuitBreaker")]
     pub circuit_breaker: CircuitBreakerSettings,
     #[serde(rename = "circuitState")]
@@ -554,7 +554,7 @@ async fn handle_health(State(_state): State<Arc<ProxyState>>) -> impl IntoRespon
         "ok": true,
         "candidates": candidates,
         "supportedApis": supported_apis.into_iter().collect::<Vec<_>>(),
-        "failover": &config.settings.proxy.failover,
+        "rules": &config.settings.proxy.rules,
         "circuitBreaker": &config.settings.proxy.circuit_breaker,
         "circuitState": circuit_state,
     }))
@@ -1615,6 +1615,30 @@ fn exposes(config: &crate::config::PiSwitchConfig, name: &str, model: &str) -> b
         .unwrap_or(false)
 }
 
+/// The model id to actually send upstream when forwarding `real_model` via profile `name`:
+/// the profile's own `modelMap` mapping wins, then an exact `exposedModels` hit.
+/// `None` means the profile cannot serve the model — the gateway skips it in the chain.
+fn effective_model_for(
+    config: &crate::config::PiSwitchConfig,
+    name: &str,
+    real_model: &str,
+) -> Option<String> {
+    if exposes(config, name, real_model) {
+        return Some(real_model.to_string());
+    }
+    let profile = config
+        .profiles
+        .get(name)
+        .and_then(|v| serde_json::from_value::<ProviderProfile>(v.clone()).ok())?;
+    profile
+        .model_map
+        .as_ref()
+        .and_then(|map| map.get(real_model))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// All non-proxy profiles that expose at least one model.
 fn exposed_profiles(config: &crate::config::PiSwitchConfig) -> Vec<String> {
     config
@@ -1634,36 +1658,41 @@ fn exposed_profiles(config: &crate::config::PiSwitchConfig) -> Vec<String> {
 /// Resolve a (namespaced) requested model into the ordered list of profiles to try and the
 /// real upstream model id to send. Stateless — derived entirely from the request + config.
 ///
-/// - `"profile/real"` → primary `profile`, then failover-chain profiles that also expose `real`.
-/// - bare `"id"` (defensive fallback) → every non-proxy profile exposing `id`, failover-first.
+/// 1. If a failover rule matches the requested model id, its `providers` chain wins
+///    (provider-level granularity; each provider may map the model via `modelMap`).
+/// 2. Otherwise: `"profile/real"` → that single profile; bare `"id"` (defensive fallback)
+///    → every non-proxy profile exposing `id`.
 ///
 /// Splits on the FIRST `/` only, so real ids that themselves contain `/`
 /// (e.g. `openrouter/anthropic/claude-sonnet-4.5`) resolve correctly.
 fn resolve_route(config: &crate::config::PiSwitchConfig, requested: &str) -> (Vec<String>, String) {
+    let real_model = match requested.split_once('/') {
+        Some((prefix, rest)) if is_non_proxy(config, prefix) && exposes(config, prefix, rest) => {
+            rest.to_string()
+        }
+        _ => requested.to_string(),
+    };
+
+    // Rules first: the first matching rule decides the provider chain.
+    if let Some(rule) = crate::config::find_rule(config, &real_model) {
+        let mut profiles = Vec::new();
+        for name in &rule.providers {
+            if is_non_proxy(config, name) && !profiles.contains(name) {
+                profiles.push(name.clone());
+            }
+        }
+        return (profiles, real_model);
+    }
+
+    // No rule matched: explicit namespacing routes to that single profile (no failover
+    // without a rule); bare ids try every profile exposing them, in config order.
     if let Some((prefix, rest)) = requested.split_once('/') {
         if is_non_proxy(config, prefix) && exposes(config, prefix, rest) {
-            let mut profiles = vec![prefix.to_string()];
-            for fo in &config.settings.proxy.failover {
-                if fo != prefix
-                    && is_non_proxy(config, fo)
-                    && exposes(config, fo, rest)
-                    && !profiles.contains(fo)
-                {
-                    profiles.push(fo.clone());
-                }
-            }
-            return (profiles, rest.to_string());
+            return (vec![prefix.to_string()], rest.to_string());
         }
     }
 
-    // Bare / unknown namespacing: any non-proxy profile exposing the whole string,
-    // failover-chain order first.
     let mut profiles = Vec::new();
-    for fo in &config.settings.proxy.failover {
-        if is_non_proxy(config, fo) && exposes(config, fo, requested) && !profiles.contains(fo) {
-            profiles.push(fo.clone());
-        }
-    }
     for name in config.profiles.keys() {
         if is_non_proxy(config, name)
             && exposes(config, name, requested)
@@ -2075,11 +2104,6 @@ async fn forward_responses_mixed(
     let mut half_open_used = false;
     // Remembered so a conversion failure only surfaces if the whole chain fails.
     let mut conversion_error: Option<ResponsesConversionError> = None;
-    let mut out_body = body.clone();
-    if !real_model.is_empty() {
-        out_body["model"] = json!(real_model);
-    }
-    let body = &out_body;
 
     for name in candidates {
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
@@ -2090,7 +2114,7 @@ async fn forward_responses_mixed(
                 Some("circuit_open"),
                 None,
                 None,
-                body.get("model").and_then(|v| v.as_str()),
+                Some(real_model),
                 conversation_id,
                 conversation_name.as_deref(),
             )
@@ -2104,7 +2128,7 @@ async fn forward_responses_mixed(
                     Some("half_open_already_probing"),
                     None,
                     None,
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(real_model),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2124,6 +2148,21 @@ async fn forward_responses_mixed(
         if !is_native && !is_convert {
             continue;
         }
+
+        // The model id this provider actually serves: its modelMap mapping wins, then
+        // an exact exposedModels hit. Providers that cannot serve the model are skipped.
+        let Some(effective) = effective_model_for(config, name, real_model) else {
+            continue;
+        };
+        // Rewrite the requested model to the provider's effective upstream id.
+        let body_for_profile = {
+            let mut b = body.clone();
+            if !effective.is_empty() {
+                b["model"] = json!(effective);
+            }
+            b
+        };
+
         let effective_spoof = profile.spoof.as_deref().or(global_spoof);
         let (client, user_agent, disguise) = build_disguised_client(effective_spoof);
         let api_key = crate::config::resolve_env(&profile.api_key);
@@ -2136,9 +2175,9 @@ async fn forward_responses_mixed(
         let request_headers =
             build_upstream_headers(headers, &profile, &api_key, user_agent.as_ref(), &disguise);
         let send_body = if is_native {
-            body.clone()
+            body_for_profile.clone()
         } else {
-            match responses_to_chat(body) {
+            match responses_to_chat(&body_for_profile) {
                 Ok(converted) => converted,
                 Err(error) => {
                     conversion_error = Some(error);
@@ -2159,7 +2198,7 @@ async fn forward_responses_mixed(
                 let response_headers = upstream.headers().clone();
                 let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
                 record_success(name, is_half_open).await;
-                let model = body.get("model").and_then(|v| v.as_str());
+                let model = Some(effective.as_str());
                 if is_native {
                     let usage = serde_json::from_slice::<Value>(&body_bytes)
                         .ok()
@@ -2175,7 +2214,7 @@ async fn forward_responses_mixed(
                         usage,
                         conversation_id,
                         conversation_name.as_deref(),
-                        lookup_model_cost(&profile, real_model),
+                        lookup_model_cost(&profile, &effective),
                     )
                     .await;
                     return Ok(buffered_response(status, &response_headers, body_bytes));
@@ -2186,7 +2225,7 @@ async fn forward_responses_mixed(
                         let usage = crate::usage::extract_usage(&chat);
                         match chat_response_to_responses(
                             chat,
-                            real_model,
+                            &effective,
                             Some(chrono::Utc::now().timestamp() as u64),
                         ) {
                             Ok(responses_body) => {
@@ -2201,7 +2240,7 @@ async fn forward_responses_mixed(
                                     usage,
                                     conversation_id,
                                     conversation_name.as_deref(),
-                                    lookup_model_cost(&profile, real_model),
+                                    lookup_model_cost(&profile, &effective),
                                 )
                                 .await;
                                 let s = serde_json::to_string(&responses_body).unwrap_or_default();
@@ -2265,7 +2304,7 @@ async fn forward_responses_mixed(
                     Some(&format!("HTTP {status}")),
                     Some(status),
                     Some(&url),
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2281,7 +2320,7 @@ async fn forward_responses_mixed(
                     None,
                     Some(status.as_u16()),
                     Some(&url),
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2296,7 +2335,7 @@ async fn forward_responses_mixed(
                     Some(&message),
                     None,
                     None,
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2331,11 +2370,6 @@ async fn forward_responses_mixed_stream(
     let global_spoof = config.settings.proxy.user_agent.as_deref();
     let mut half_open_used = false;
     let mut conversion_error: Option<ResponsesConversionError> = None;
-    let mut out_body = body.clone();
-    if !real_model.is_empty() {
-        out_body["model"] = json!(real_model);
-    }
-    let body = &out_body;
 
     for name in candidates {
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
@@ -2346,7 +2380,7 @@ async fn forward_responses_mixed_stream(
                 Some("circuit_open"),
                 None,
                 None,
-                body.get("model").and_then(|v| v.as_str()),
+                Some(real_model),
                 conversation_id,
                 conversation_name.as_deref(),
             )
@@ -2360,7 +2394,7 @@ async fn forward_responses_mixed_stream(
                     Some("half_open_already_probing"),
                     None,
                     None,
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(real_model),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2380,6 +2414,21 @@ async fn forward_responses_mixed_stream(
         if !is_native && !is_convert {
             continue;
         }
+
+        // The model id this provider actually serves: its modelMap mapping wins, then
+        // an exact exposedModels hit. Providers that cannot serve the model are skipped.
+        let Some(effective) = effective_model_for(config, name, real_model) else {
+            continue;
+        };
+        // Rewrite the requested model to the provider's effective upstream id.
+        let body_for_profile = {
+            let mut b = body.clone();
+            if !effective.is_empty() {
+                b["model"] = json!(effective);
+            }
+            b
+        };
+
         let effective_spoof = profile.spoof.as_deref().or(global_spoof);
         let (client, user_agent, disguise) = build_disguised_client(effective_spoof);
         let api_key = crate::config::resolve_env(&profile.api_key);
@@ -2392,9 +2441,9 @@ async fn forward_responses_mixed_stream(
         let request_headers =
             build_upstream_headers(headers, &profile, &api_key, user_agent.as_ref(), &disguise);
         let send_body = if is_native {
-            body.clone()
+            body_for_profile.clone()
         } else {
-            match responses_to_chat(body) {
+            match responses_to_chat(&body_for_profile) {
                 Ok(mut converted) => {
                     converted["stream"] = json!(true);
                     converted
@@ -2415,7 +2464,7 @@ async fn forward_responses_mixed_stream(
         match response {
             Ok(upstream) if upstream.status().is_success() => {
                 let status = upstream.status().as_u16();
-                let model = body.get("model").and_then(|v| v.as_str());
+                let model = Some(effective.as_str());
                 if is_native {
                     record_success(name, is_half_open).await;
                     let mut fields = StreamLogFields::for_success(
@@ -2426,7 +2475,7 @@ async fn forward_responses_mixed_stream(
                         conversation_id,
                         conversation_name.as_deref(),
                     );
-                    fields.cost = lookup_model_cost(&profile, real_model);
+                    fields.cost = lookup_model_cost(&profile, &effective);
                     return Ok(stream_response(upstream, Some(fields)));
                 }
                 // Convert: the upstream must be an SSE stream; anything else is
@@ -2460,8 +2509,8 @@ async fn forward_responses_mixed_stream(
                     conversation_id,
                     conversation_name.as_deref(),
                 );
-                fields.cost = lookup_model_cost(&profile, real_model);
-                let converter = ChatSseToResponses::new(real_model);
+                fields.cost = lookup_model_cost(&profile, &effective);
+                let converter = ChatSseToResponses::new(&effective);
                 let transform =
                     ResponsesStreamTransform::new(upstream.bytes_stream(), converter, fields);
                 return Ok(builder.body(Body::from_stream(transform)).unwrap());
@@ -2480,7 +2529,7 @@ async fn forward_responses_mixed_stream(
                     Some(&format!("HTTP {status}")),
                     Some(status),
                     Some(&url),
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2496,7 +2545,7 @@ async fn forward_responses_mixed_stream(
                     None,
                     Some(status.as_u16()),
                     Some(&url),
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2511,7 +2560,7 @@ async fn forward_responses_mixed_stream(
                     Some(&message),
                     None,
                     None,
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     conversation_id,
                     conversation_name.as_deref(),
                 )
@@ -2559,16 +2608,6 @@ async fn forward_with_failover(
     let mut circuit_state = read_circuit_state().await;
     let global_spoof = config.settings.proxy.user_agent.as_deref();
     let mut half_open_used = false;
-
-    // Rewrite the namespaced "profile/model" back to the real upstream model id.
-    let out_body = {
-        let mut b = body.clone();
-        if !real_model.is_empty() {
-            b["model"] = json!(real_model);
-        }
-        b
-    };
-    let body = &out_body;
 
     for name in candidates {
         let profile_value = match config.profiles.get(name) {
@@ -2630,6 +2669,20 @@ async fn forward_with_failover(
             continue;
         }
 
+        // The model id this provider actually serves: its modelMap mapping wins, then
+        // an exact exposedModels hit. Providers that cannot serve the model are skipped.
+        let Some(effective) = effective_model_for(config, name, real_model) else {
+            continue;
+        };
+        // Rewrite the requested model to the provider's effective upstream id.
+        let body_for_profile = {
+            let mut b = body.clone();
+            if !effective.is_empty() {
+                b["model"] = json!(effective);
+            }
+            b
+        };
+
         // Effective disguise: per-profile spoof overrides the global setting.
         let effective_spoof = profile.spoof.as_deref().or(global_spoof);
         let (client, user_agent, disguise) = build_disguised_client(effective_spoof);
@@ -2638,7 +2691,7 @@ async fn forward_with_failover(
 
         if is_anthropic {
             // Convert OpenAI -> Anthropic
-            let anthro_body = openai_to_anthropic_body(body);
+            let anthro_body = openai_to_anthropic_body(&body_for_profile);
             let url = format!("{}/messages", profile.base_url.trim_end_matches('/'));
 
             let mut req = client
@@ -2668,11 +2721,11 @@ async fn forward_with_failover(
                             Some(status.as_u16()),
                             Some(&url),
                             None,
-                            body.get("model").and_then(|v| v.as_str()),
+                            Some(effective.as_str()),
                             usage,
                             conversation_id,
                             conversation_name.as_deref(),
-                            lookup_model_cost(&profile, real_model),
+                            lookup_model_cost(&profile, &effective),
                         )
                         .await;
                         return Ok(Json(openai_data).into_response());
@@ -2692,7 +2745,7 @@ async fn forward_with_failover(
                             Some(status_code),
                             Some(&url),
                             None,
-                            body.get("model").and_then(|v| v.as_str()),
+                            Some(effective.as_str()),
                             None,
                             conversation_id,
                             conversation_name.as_deref(),
@@ -2710,7 +2763,7 @@ async fn forward_with_failover(
                             Some(status.as_u16()),
                             Some(&url),
                             None,
-                            body.get("model").and_then(|v| v.as_str()),
+                            Some(effective.as_str()),
                             None,
                             conversation_id,
                             conversation_name.as_deref(),
@@ -2732,7 +2785,7 @@ async fn forward_with_failover(
                         None,
                         None,
                         None,
-                        body.get("model").and_then(|v| v.as_str()),
+                        Some(effective.as_str()),
                         None,
                         conversation_id,
                         conversation_name.as_deref(),
@@ -2749,9 +2802,9 @@ async fn forward_with_failover(
             // Console Go (opencode.ai) rejects the `developer` role; rewrite for any
             // client that still sends it (see `normalize_developer_role`).
             let send_body = if crate::config::is_opencode_upstream(&profile) {
-                normalize_developer_role(body)
+                normalize_developer_role(&body_for_profile)
             } else {
-                body.clone()
+                body_for_profile.clone()
             };
 
             let mut req = client
@@ -2779,11 +2832,11 @@ async fn forward_with_failover(
                                 name,
                                 status.as_u16(),
                                 &url,
-                                body.get("model").and_then(|v| v.as_str()),
+                                Some(effective.as_str()),
                                 conversation_id,
                                 conversation_name.as_deref(),
                             );
-                            fields.cost = lookup_model_cost(&profile, real_model);
+                            fields.cost = lookup_model_cost(&profile, &effective);
                             Some(fields)
                         } else {
                             None
@@ -2805,7 +2858,7 @@ async fn forward_with_failover(
                             Some(status_code),
                             Some(&url),
                             None,
-                            body.get("model").and_then(|v| v.as_str()),
+                            Some(effective.as_str()),
                             None,
                             conversation_id,
                             conversation_name.as_deref(),
@@ -2823,7 +2876,7 @@ async fn forward_with_failover(
                             Some(status.as_u16()),
                             Some(&url),
                             None,
-                            body.get("model").and_then(|v| v.as_str()),
+                            Some(effective.as_str()),
                             None,
                             conversation_id,
                             conversation_name.as_deref(),
@@ -2842,7 +2895,7 @@ async fn forward_with_failover(
                         None,
                         None,
                         None,
-                        body.get("model").and_then(|v| v.as_str()),
+                        Some(effective.as_str()),
                         None,
                         conversation_id,
                         conversation_name.as_deref(),
@@ -2873,16 +2926,6 @@ async fn forward_anthropic_with_failover(
     let global_spoof = config.settings.proxy.user_agent.as_deref();
     let mut half_open_used = false;
 
-    // Rewrite the namespaced "profile/model" back to the real upstream model id.
-    let out_body = {
-        let mut b = body.clone();
-        if !real_model.is_empty() {
-            b["model"] = json!(real_model);
-        }
-        b
-    };
-    let body = &out_body;
-
     for name in candidates {
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
         route_mark_attempt(name, is_half_open);
@@ -2910,6 +2953,20 @@ async fn forward_anthropic_with_failover(
             continue;
         }
 
+        // The model id this provider actually serves: its modelMap mapping wins, then
+        // an exact exposedModels hit. Providers that cannot serve the model are skipped.
+        let Some(effective) = effective_model_for(config, name, real_model) else {
+            continue;
+        };
+        // Rewrite the requested model to the provider's effective upstream id.
+        let body_for_profile = {
+            let mut b = body.clone();
+            if !effective.is_empty() {
+                b["model"] = json!(effective);
+            }
+            b
+        };
+
         // Effective disguise: per-profile spoof overrides the global setting.
         let effective_spoof = profile.spoof.as_deref().or(global_spoof);
         let (client, user_agent, disguise) = build_disguised_client(effective_spoof);
@@ -2927,7 +2984,7 @@ async fn forward_anthropic_with_failover(
         for (k, v) in &disguise {
             req = req.header(*k, *v);
         }
-        let resp = req.json(body).send().await;
+        let resp = req.json(&body_for_profile).send().await;
 
         match resp {
             Ok(r) if r.status().is_success() || !should_retry(r.status().as_u16()) => {
@@ -2941,11 +2998,11 @@ async fn forward_anthropic_with_failover(
                         name,
                         status.as_u16(),
                         &url,
-                        body.get("model").and_then(|v| v.as_str()),
+                        Some(effective.as_str()),
                         conversation_id,
                         conversation_name.as_deref(),
                     );
-                    fields.cost = lookup_model_cost(&profile, real_model);
+                    fields.cost = lookup_model_cost(&profile, &effective);
                     return Ok(stream_response(r, Some(fields)));
                 }
                 log_request(
@@ -2955,7 +3012,7 @@ async fn forward_anthropic_with_failover(
                     Some(status.as_u16()),
                     Some(&url),
                     None,
-                    body.get("model").and_then(|v| v.as_str()),
+                    Some(effective.as_str()),
                     None,
                     conversation_id,
                     conversation_name.as_deref(),
@@ -3135,13 +3192,24 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
-    fn cfg(profiles: serde_json::Value, failover: Vec<&str>) -> PiSwitchConfig {
+    fn cfg(profiles: serde_json::Value, rules: Vec<crate::config::FailoverRule>) -> PiSwitchConfig {
         let mut c = PiSwitchConfig::default();
         if let Some(obj) = profiles.as_object() {
             c.profiles = obj.clone();
         }
-        c.settings.proxy.failover = failover.into_iter().map(String::from).collect();
+        c.settings.proxy.rules = rules;
         c
+    }
+
+    fn rule(prefix: &str, providers: &[&str]) -> crate::config::FailoverRule {
+        crate::config::FailoverRule {
+            name: None,
+            r#match: crate::config::RuleMatch {
+                model_prefix: Some(prefix.to_string()),
+                model_contains: None,
+            },
+            providers: providers.iter().map(|s| s.to_string()).collect(),
+        }
     }
     #[tokio::test]
     async fn native_responses_non_streaming_preserves_body_and_response() {
@@ -3536,7 +3604,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["native"],
+            vec![rule("model-a", &["chat", "native"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -3609,7 +3677,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["chat"],
+            vec![rule("model-a", &["native", "chat"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -3766,7 +3834,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["ok"],
+            vec![rule("model-a", &["fail", "ok"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -3850,7 +3918,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["backup"],
+            vec![rule("model-a", &["broken", "backup"])],
         );
 
         let response = handle_responses_with_config(
@@ -4119,7 +4187,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["native"],
+            vec![rule("model-a", &["chat", "native"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -4195,7 +4263,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["chat"],
+            vec![rule("model-a", &["native", "chat"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -4393,7 +4461,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec!["native"],
+            vec![rule("model-a", &["chat", "native"])],
         );
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -4667,32 +4735,96 @@ mod tests {
     }
 
     #[test]
-    fn namespaced_adds_failover_sharing_model() {
+    fn rule_prefix_wins_over_namespaced_routing() {
+        // A matching rule's provider chain replaces the requested profile entirely
+        // (provider-level granularity: fox serves the model even though hyb was named).
         let c = cfg(
             serde_json::json!({
                 "hyb": { "proxy": false, "exposedModels": ["gpt-5.4"] },
                 "fox": { "proxy": false, "exposedModels": ["gpt-5.4"] },
             }),
-            vec!["fox"],
+            vec![crate::config::FailoverRule {
+                name: Some("gpt-chain".into()),
+                r#match: crate::config::RuleMatch {
+                    model_prefix: Some("gpt-".into()),
+                    model_contains: None,
+                },
+                providers: vec!["fox".into(), "hyb".into()],
+            }],
         );
         let (profiles, real) = resolve_route(&c, "hyb/gpt-5.4");
-        assert_eq!(profiles, vec!["hyb".to_string(), "fox".to_string()]);
+        assert_eq!(profiles, vec!["fox".to_string(), "hyb".to_string()]);
         assert_eq!(real, "gpt-5.4");
     }
 
     #[test]
-    fn bare_id_failover_first() {
+    fn rule_contains_matches_bare_id() {
         let c = cfg(
             serde_json::json!({
-                "aiapi": { "proxy": false, "exposedModels": ["gpt-5.4"] },
-                "hyb": { "proxy": false, "exposedModels": ["gpt-5.4"] },
+                "ds": { "proxy": false, "exposedModels": ["deepseek-v4-pro"] },
             }),
-            vec!["hyb"],
+            vec![crate::config::FailoverRule {
+                name: None,
+                r#match: crate::config::RuleMatch {
+                    model_prefix: None,
+                    model_contains: Some("deepseek".into()),
+                },
+                providers: vec!["ds".into()],
+            }],
         );
-        let (profiles, real) = resolve_route(&c, "gpt-5.4");
-        assert_eq!(profiles.first(), Some(&"hyb".to_string())); // failover-first
-        assert!(profiles.contains(&"aiapi".to_string()));
-        assert_eq!(real, "gpt-5.4");
+        let (profiles, real) = resolve_route(&c, "deepseek-v4-pro");
+        assert_eq!(profiles, vec!["ds".to_string()]);
+        assert_eq!(real, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn rule_providers_skip_missing_and_proxy_profiles() {
+        let c = cfg(
+            serde_json::json!({
+                "a": { "proxy": false, "exposedModels": ["gpt-5.4"] },
+                "gw": { "proxy": true },
+            }),
+            vec![crate::config::FailoverRule {
+                name: Some("chain".into()),
+                r#match: crate::config::RuleMatch {
+                    model_prefix: Some("gpt-".into()),
+                    model_contains: None,
+                },
+                providers: vec!["ghost".into(), "gw".into(), "a".into()],
+            }],
+        );
+        let (profiles, _real) = resolve_route(&c, "gpt-5.4");
+        assert_eq!(profiles, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn first_matching_rule_wins() {
+        let c = cfg(
+            serde_json::json!({
+                "a": { "proxy": false, "exposedModels": ["gpt-5.4"] },
+                "b": { "proxy": false, "exposedModels": ["gpt-5.4"] },
+            }),
+            vec![
+                crate::config::FailoverRule {
+                    name: Some("all-gpt".into()),
+                    r#match: crate::config::RuleMatch {
+                        model_prefix: Some("gpt-".into()),
+                        model_contains: None,
+                    },
+                    providers: vec!["a".into()],
+                },
+                crate::config::FailoverRule {
+                    name: Some("gpt5-chain".into()),
+                    r#match: crate::config::RuleMatch {
+                        model_prefix: Some("gpt-5".into()),
+                        model_contains: None,
+                    },
+                    providers: vec!["b".into()],
+                },
+            ],
+        );
+        let (profiles, _real) = resolve_route(&c, "gpt-5.4");
+        assert_eq!(profiles, vec!["a".to_string()]);
     }
 
     #[test]
@@ -5796,5 +5928,82 @@ mod tests {
         assert_eq!(normalize_developer_role(&body), body);
         let no_messages = serde_json::json!({ "model": "model-a" });
         assert_eq!(normalize_developer_role(&no_messages), no_messages);
+    }
+
+    #[tokio::test]
+    async fn opencode_upstream_forwards_rewritten_model_and_normalized_developer_role() {
+        // Regression: the opencode (Console Go) branch must forward the per-provider
+        // rewritten body (`body_for_profile`), not the raw namespaced request body.
+        // The mock upstream advertises a baseUrl containing "opencode.ai" (path trick)
+        // to trigger is_opencode_upstream while staying fully local.
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let seen_for_upstream = seen.clone();
+        let upstream = Router::new().route(
+            "/v1.opencode.ai/chat/completions",
+            post(move |body: String| {
+                let seen = seen_for_upstream.clone();
+                async move {
+                    *seen.lock().unwrap() = Some(body.clone());
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": "chatcmpl-oc",
+                                "choices": [{ "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                                "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let config = cfg(
+            serde_json::json!({
+                "opencode": {
+                    "api": "openai-completions",
+                    "baseUrl": format!("http://{}/v1.opencode.ai", address),
+                    "apiKey": "upstream-key",
+                    "exposedModels": ["deepseek-v4-flash"]
+                }
+            }),
+            vec![],
+        );
+        let body = serde_json::json!({
+            "model": "opencode/deepseek-v4-flash",
+            "messages": [
+                { "role": "developer", "content": "system prompt" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let headers = HeaderMap::new();
+        let resp = super::forward_with_failover(
+            &config,
+            &["opencode".to_string()],
+            &body,
+            "deepseek-v4-flash",
+            "chat/completions",
+            &headers,
+            None,
+            true,
+        )
+        .await
+        .expect("upstream succeeds");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent: serde_json::Value =
+            serde_json::from_str(seen.lock().unwrap().as_ref().expect("body captured")).unwrap();
+        assert_eq!(
+            sent["model"],
+            "deepseek-v4-flash",
+            "namespaced model must be rewritten before reaching opencode upstream"
+        );
+        assert_eq!(sent["messages"][0]["role"], "system");
+        server.abort();
     }
 }

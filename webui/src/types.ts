@@ -57,11 +57,22 @@ export interface CircuitBreakerSettings {
   cooldownSeconds: number;
 }
 
+export interface RuleMatch {
+  modelPrefix?: string;
+  modelContains?: string;
+}
+
+export interface FailoverRule {
+  name?: string;
+  match: RuleMatch;
+  providers: string[];
+}
+
 export interface ProxySettings {
   host: string;
   port: number;
   target?: string;
-  failover: string[];
+  rules: FailoverRule[];
   userAgent?: string;
   circuitBreaker: CircuitBreakerSettings;
 }
@@ -112,7 +123,7 @@ export interface DaemonResult {
   host?: string;
   port?: number;
   targets?: string[];
-  failover?: string[];
+  rules?: FailoverRule[];
   startedAt?: number;
   message: string;
 }

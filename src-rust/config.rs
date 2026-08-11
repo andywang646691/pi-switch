@@ -164,6 +164,71 @@ pub struct CircuitBreakerSettings {
     pub cooldown_seconds: u32,
 }
 
+/// Rule-match conditions. All provided fields must match the requested model id
+/// (the part after the leading `profile/` namespace, e.g. `deepseek-v4-pro` for
+/// `ds/deepseek-v4-pro`). At least one condition must be set for the rule to be
+/// meaningful; conditions are ANDed when several are present.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuleMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "modelPrefix")]
+    pub model_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "modelContains")]
+    pub model_contains: Option<String>,
+}
+
+impl RuleMatch {
+    /// Whether this condition set matches `model`. Returns false when no
+    /// condition is configured (an empty match never matches anything).
+    pub fn matches(&self, model: &str) -> bool {
+        let mut configured = false;
+        if let Some(prefix) = &self.model_prefix {
+            configured = true;
+            if !prefix.is_empty() && !model.starts_with(prefix.as_str()) {
+                return false;
+            }
+        }
+        if let Some(contains) = &self.model_contains {
+            configured = true;
+            if !contains.is_empty() && !model.contains(contains.as_str()) {
+                return false;
+            }
+        }
+        configured
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.model_prefix.as_deref().unwrap_or("").is_empty()
+            && self.model_contains.as_deref().unwrap_or("").is_empty()
+    }
+}
+
+/// A failover rule: when the requested model matches `match`, the gateway tries
+/// the `providers` in order (provider-level granularity — the chain is no longer
+/// limited to profiles exposing the exact same model id). Providers whose
+/// `modelMap` maps the requested model, or that expose it directly, are tried;
+/// others are skipped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FailoverRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, rename = "match")]
+    pub r#match: RuleMatch,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+}
+
+
+/// The first rule whose match conditions hit `model`, if any. Rules are evaluated
+/// in configured order; the first hit wins.
+pub fn find_rule<'a>(config: &'a PiSwitchConfig, model: &str) -> Option<&'a FailoverRule> {
+    config
+        .settings
+        .proxy
+        .rules
+        .iter()
+        .find(|rule| rule.r#match.matches(model))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxySettings {
     #[serde(default = "default_host")]
@@ -172,8 +237,10 @@ pub struct ProxySettings {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Failover rules: first matching rule decides the provider chain. Replaces
+    /// the legacy single global `failover` chain.
     #[serde(default)]
-    pub failover: Vec<String>,
+    pub rules: Vec<FailoverRule>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "userAgent")]
     pub user_agent: Option<String>,
     #[serde(default, rename = "circuitBreaker")]
@@ -277,7 +344,7 @@ impl Default for PiSwitchConfig {
                     host: default_host(),
                     port: default_port(),
                     target: None,
-                    failover: vec![],
+                    rules: vec![],
                     user_agent: None,
                     circuit_breaker: CircuitBreakerSettings {
                         enabled: true,
@@ -853,13 +920,29 @@ pub fn validate_config() -> Result<Vec<ValidationIssue>> {
         });
     }
 
-    for (i, name) in config.settings.proxy.failover.iter().enumerate() {
-        if !config.profiles.contains_key(name) {
+    for (i, rule) in config.settings.proxy.rules.iter().enumerate() {
+        if rule.r#match.is_empty() {
             issues.push(ValidationIssue {
                 level: "warning".into(),
-                path: format!("settings.proxy.failover[{}]", i),
-                message: format!("Failover provider '{}' does not exist", name),
+                path: format!("settings.proxy.rules[{}].match", i),
+                message: "Rule has no match conditions (modelPrefix / modelContains)".into(),
             });
+        }
+        if rule.providers.is_empty() {
+            issues.push(ValidationIssue {
+                level: "warning".into(),
+                path: format!("settings.proxy.rules[{}].providers", i),
+                message: "Rule has no providers".into(),
+            });
+        }
+        for (j, name) in rule.providers.iter().enumerate() {
+            if !config.profiles.contains_key(name) {
+                issues.push(ValidationIssue {
+                    level: "warning".into(),
+                    path: format!("settings.proxy.rules[{}].providers[{}]", i, j),
+                    message: format!("Rule provider '{}' does not exist", name),
+                });
+            }
         }
     }
 

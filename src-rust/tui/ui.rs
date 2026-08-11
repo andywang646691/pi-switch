@@ -58,7 +58,7 @@ fn render_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Route::Stats => pages::render_stats(frame, app, area),
         Route::Backups => pages::render_backups(frame, app, area),
         Route::Settings => pages::render_settings(frame, app, area),
-        Route::FailoverEditor => pages::render_failover_editor(frame, app, area),
+        Route::RulesEditor => pages::render_rules_editor(frame, app, area),
     }
 }
 

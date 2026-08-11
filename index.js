@@ -35,7 +35,7 @@ export const {
   updateExposedModels,
   updateProviderModels,
   setProxyTarget,
-  setProxyFailover,
+  setProxyRules,
   // Package management
   initPackages,
   listPackages,

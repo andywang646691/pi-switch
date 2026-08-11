@@ -76,8 +76,10 @@ function buildCandidateNames(config, explicitProfile) {
       }
     }
   } else {
-    // Fallback: use failover list or all non-proxy profiles
-    for (const name of config.settings.proxy.failover || []) add(name);
+    // Fallback: use rule provider chains or all non-proxy profiles
+    for (const rule of config.settings.proxy.rules || []) {
+      for (const name of rule.providers || []) add(name);
+    }
     if (names.length === 0) add(pickDefaultTarget(config));
   }
 
@@ -465,7 +467,7 @@ export async function daemonStatus() {
     host,
     port,
     target: config.settings.proxy.target,
-    failover: config.settings.proxy.failover || [],
+    rules: config.settings.proxy.rules || [],
     logPath: DAEMON_LOG_PATH,
     startedAt: info.startedAt,
     message: `Proxy daemon running (PID ${info.pid}) on http://${host}:${port}`,
@@ -773,7 +775,7 @@ export async function startProxy(options = {}) {
             openai: "/v1/chat/completions",
             anthropic: "/v1/messages",
           },
-          failover: activeConfig.settings.proxy.failover || [],
+          rules: activeConfig.settings.proxy.rules || [],
           circuitBreaker: activeConfig.settings.proxy.circuitBreaker,
           circuitState: await readCircuitState(),
         });

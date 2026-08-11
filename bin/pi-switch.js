@@ -11,7 +11,7 @@ import {
   runNativeTui,
   updateExposedModels,
   updateProviderModels,
-  setProxyFailover,
+  setProxyRules,
   // Package management
   initPackages, listPackages, getPackage, addPackage,
   installPackage, uninstallPackage, enablePackage, disablePackage,
@@ -77,7 +77,9 @@ Usage:
   pi-switch proxy start  [--host <ip>] [--port <port>] [--daemon]
   pi-switch proxy stop
   pi-switch proxy status
-  pi-switch proxy failover <profile1,profile2,...>     # Same-model fallback order
+  pi-switch proxy rules list                              # Show failover rules
+  pi-switch proxy rules set <json>                       # Set failover rules (rule-based, provider-level)
+  pi-switch proxy rules clear                            # Remove all failover rules
   pi-switch webui start  [--host <ip>] [--port <port>] [--daemon]   # Browser config UI
   pi-switch webui stop
   pi-switch webui status
@@ -89,7 +91,7 @@ Usage:
 Gateway Workflow:
   1. Add profiles:          pi-switch provider add <name> ...
   2. Expose models:         choose models per profile (tui: 'x'), or expose all
-  3. (optional) Failover:   pi-switch proxy failover <backup1,backup2>
+  3. (optional) Rules:      pi-switch proxy rules set '<json>'  # e.g. [{"match":{"modelPrefix":"gpt"},"providers":["a","b"]}]
   4. Start proxy:           pi-switch proxy start --daemon
   5. Use in pi:             select the 'pi-switch' provider, then a 'profile/model'
      The proxy routes by the model name in each request — no target to set.
@@ -265,13 +267,17 @@ async function main() {
         if (names.length === 0) { console.log("No profiles. Add one with: pi-switch provider add <name> ..."); return; }
 
         // Get proxy configuration
-        const target = data.settings?.proxy?.target;
-        const failoverChain = data.settings?.proxy?.failover || [];
+        const rules = data.settings?.proxy?.rules || [];
 
-        // Build failover priority map (target is p0, failover are p1, p2, ...)
+        // Build failover priority map: a provider's priority is the first position
+        // at which it appears across all rule provider chains.
         const priorityMap = new Map();
-        if (target) priorityMap.set(target, 0);
-        failoverChain.forEach((name, idx) => priorityMap.set(name, idx + 1));
+        let next = 0;
+        for (const rule of rules) {
+          for (const name of rule.providers || []) {
+            if (!priorityMap.has(name)) priorityMap.set(name, next++);
+          }
+        }
 
         // Get circuit breaker status
         const stats = JSON.parse(getUsageStats());
@@ -287,7 +293,7 @@ async function main() {
           const p = data.profiles[name];
           const models = (p.models || []).map(m => m.id).join(", ");
 
-          // Check if in failover chain
+          // Check if referenced by any rule
           const priority = priorityMap.get(name);
           const inChain = priority !== undefined;
           const mark = inChain ? "*" : " ";
@@ -299,7 +305,7 @@ async function main() {
           // Build priority label
           let priorityLabel = "";
           if (inChain) {
-            priorityLabel = priority === 0 ? " [target]" : ` [p${priority}]`;
+            priorityLabel = ` [p${priority}]`;
           }
 
           // Color based on circuit breaker state
@@ -801,23 +807,52 @@ async function main() {
           console.log(`Proxy daemon is running (PID ${result.pid})`);
           console.log(`Listen: http://${result.host}:${result.port}`);
           if (result.target) console.log(`Target: ${result.target}`);
-          if (result.failover?.length) console.log(`Failover: ${result.failover.join(" → ")}`);
+          if (result.rules?.length) console.log(`Rules: ${result.rules.length} failover rule(s)`);
         } else {
           console.log(result.message);
         }
         return;
       }
 
-      if (sub === "failover") {
-        const profiles = rest[1];
-        if (!profiles) fail("failover profiles required (comma-separated)");
-        const profileList = profiles.split(',').map(s => s.trim()).filter(Boolean);
-        const result = setProxyFailover(profileList);
-        console.log(result);
+      if (sub === "rules") {
+        const action = rest[1] || "list";
+        if (action === "clear") {
+          console.log(setProxyRules([]));
+        } else if (action === "list") {
+          const data = JSON.parse(listProfiles());
+          const rules = data.settings?.proxy?.rules || [];
+          if (rules.length === 0) {
+            console.log("No failover rules configured. Set them with:");
+            console.log('  pi-switch proxy rules set \'[{"match":{"modelPrefix":"gpt"},"providers":["a","b"]}]\'');
+            return;
+          }
+          rules.forEach((rule, i) => {
+            const name = rule.name || `(rule ${i + 1})`;
+            const conditions = [];
+            if (rule.match?.modelPrefix) conditions.push(`prefix:${rule.match.modelPrefix}`);
+            if (rule.match?.modelContains) conditions.push(`contains:${rule.match.modelContains}`);
+            const match = conditions.length ? conditions.join(" & ") : "match:*";
+            console.log(`${i + 1}. ${name}  [${match}]`);
+            console.log(`   → ${(rule.providers || []).join(" → ") || "(no providers)"}`);
+          });
+        } else if (action === "set") {
+          const json = rest[2];
+          if (!json) fail("rules JSON required, e.g. [{\"match\":{\"modelPrefix\":\"gpt\"},\"providers\":[\"a\",\"b\"]}]");
+          let rules;
+          try {
+            rules = JSON.parse(json);
+          } catch (e) {
+            fail(`invalid rules JSON: ${e.message}`);
+          }
+          if (!Array.isArray(rules)) fail("rules must be a JSON array");
+          console.log(setProxyRules(rules));
+        } else {
+          fail("usage: pi-switch proxy rules [list|set <json>|clear]");
+        }
         return;
       }
 
-      fail("usage: pi-switch proxy [start|stop|status|failover]");
+      fail("usage: pi-switch proxy [start|stop|status|rules]");
     }
 
     // ─── WebUI subcommands ───────────────────────────

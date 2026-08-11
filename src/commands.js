@@ -254,22 +254,27 @@ export async function doctor() {
   return checks;
 }
 
-export async function setProxyTarget(target, failover = undefined) {
-  if (!target) throw new Error("target profile required");
+export async function setProxyRules(rules) {
+  if (!Array.isArray(rules)) throw new Error("rules must be an array");
   const config = await loadConfig();
-  if (!config.profiles[target]) throw new Error(`unknown profile '${target}'`);
+  for (const rule of rules) {
+    const match = rule?.match ?? {};
+    if (!match.modelPrefix && !match.modelContains) {
+      throw new Error("each rule needs match.modelPrefix and/or match.modelContains");
+    }
+    if (!Array.isArray(rule?.providers) || rule.providers.length === 0) {
+      throw new Error("each rule needs a non-empty providers chain");
+    }
+    for (const name of rule.providers) {
+      if (!config.profiles[name]) throw new Error(`unknown rule provider '${name}'`);
+      if (config.profiles[name]?.proxy) throw new Error(`rule provider '${name}' is a proxy profile`);
+    }
+  }
   const backup = await backupFile(CONFIG_PATH, "config");
   config.settings.proxy ??= {};
-  config.settings.proxy.target = target;
-  if (failover !== undefined) {
-    for (const name of failover) {
-      if (!config.profiles[name]) throw new Error(`unknown failover profile '${name}'`);
-      if (config.profiles[name]?.proxy) throw new Error(`failover profile '${name}' is a proxy profile`);
-    }
-    config.settings.proxy.failover = failover;
-  }
+  config.settings.proxy.rules = rules;
   await saveConfig(config);
-  return { target, failover: config.settings.proxy.failover || [], backup };
+  return { rules, backup };
 }
 
 export function proxyProviderProfile(host = "127.0.0.1", port = 43112) {

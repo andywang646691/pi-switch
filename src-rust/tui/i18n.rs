@@ -256,7 +256,7 @@ pub fn home_requests_fmt(total: u64, ok: u64, rate: &str) -> String {
 // ─── Proxy labels ────────────────────────────────────────
 
 pub fn proxy_failover() -> &'static str {
-    t!("Failover", "故障转移")
+    t!("Failover rules", "故障转移规则")
 }
 pub fn proxy_listen() -> &'static str {
     t!("Listen", "监听")
@@ -808,7 +808,7 @@ pub fn settings_proxy_port() -> &'static str {
     t!("Proxy port", "代理端口")
 }
 pub fn settings_proxy_failover() -> &'static str {
-    t!("Failover chain", "故障转移链")
+    t!("Failover rules", "故障转移规则")
 }
 pub fn settings_saved() -> &'static str {
     t!("Settings saved", "设置已保存")

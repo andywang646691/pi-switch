@@ -110,7 +110,7 @@ pub fn make_web_router(state: Arc<WebState>) -> Router {
         // proxy + settings + config
         .route("/proxy/start", post(post_proxy_start))
         .route("/proxy/stop", post(post_proxy_stop))
-        .route("/proxy/failover", put(put_failover))
+        .route("/proxy/rules", put(put_rules))
         .route("/settings", put(put_settings))
         .route("/config/export", post(post_config_export))
         .route("/config/import", post(post_config_import))
@@ -503,12 +503,12 @@ async fn post_proxy_stop() -> ApiJson {
 }
 
 #[derive(Deserialize)]
-struct FailoverBody {
-    failover: Vec<String>,
+struct RulesBody {
+    rules: Vec<crate::config::FailoverRule>,
 }
 
-async fn put_failover(Json(body): Json<FailoverBody>) -> ApiJson {
-    let backup = ops::set_failover(body.failover)?;
+async fn put_rules(Json(body): Json<RulesBody>) -> ApiJson {
+    let backup = ops::set_rules(body.rules)?;
     ok(backup_msg(backup))
 }
 

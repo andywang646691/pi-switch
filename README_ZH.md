@@ -85,7 +85,9 @@ pi-switch provider expose <名称> <model-ids...>    # 暴露模型到 pi agent
 pi-switch provider fetch-models <名称>             # 从 API 抓取模型列表
 
 # 代理（网关）
-pi-switch proxy failover <p1,p2,...>               # 同模型故障转移链
+pi-switch proxy rules list                              # 查看故障转移规则
+pi-switch proxy rules set '<json>'                     # 设置故障转移规则（规则匹配，provider 级）
+pi-switch proxy rules clear                            # 清空故障转移规则
 pi-switch proxy start --daemon                     # 启动代理守护进程
 pi-switch proxy status
 
@@ -176,7 +178,7 @@ graph LR
     subgraph Setup["⚙️ 配置阶段"]
         A[添加 Provider] --> B[配置模型]
         B --> C[暴露给 Pi]
-        C --> D[设置故障转移链]
+        C --> D[设置故障转移规则]
     end
 
     subgraph Runtime["🚀 运行阶段"]
@@ -219,7 +221,7 @@ TUI 中：`Profiles → 选择 provider → x`
 
 **3. 启动代理** — 自动写入一个 `pi-switch` 网关 provider 到 pi
 ```bash
-pi-switch proxy failover provider-b,provider-c          # 可选：同模型故障转移
+pi-switch proxy rules set '[{"match":{"modelPrefix":"gpt"},"providers":["provider-a","provider-b"]}]'  # 可选：规则故障转移
 pi-switch proxy start --daemon
 ```
 
@@ -231,7 +233,7 @@ pi-switch proxy start --daemon
 
 - **模型名路由** — `"model": "provider-a/gpt-5.4"` 解析为 profile `provider-a`、真实模型 `gpt-5.4`；转发前代理将 body.model 改回真实 ID
 - **单个网关 provider** — pi 只看到一个 `pi-switch` provider，下面列出所有暴露模型（格式 `profile/真实模型ID`）；在 pi 中切换模型 = 发送不同的 model 字符串 = 即时路由切换
-- **自动故障转移** — 429/5xx 或网络错误时，按配置链进行同模型 fallback
+- **规则故障转移** — 第一条匹配请求模型的规则决定 provider 链，429/5xx 或网络错误时按顺序尝试（provider 级粒度；provider 可通过 `modelMap` 映射模型）
 - **断路器保护** — 连续 3 次失败后进入 60s 冷却，半开探测成功后自动恢复
 - **流式（SSE）** — 同格式请求（openai→openai、anthropic→anthropic）逐字流式转发；保留上游响应头（Content-Type 等）
 - **OpenAI ↔ Anthropic** — 自动在 chat completions 和 messages API 间转换
@@ -295,13 +297,23 @@ pi-switch provider expose <名称> <model-id>...
 <summary><b>如何设置故障转移？</b></summary>
 <br>
 
-TUI 中：`Settings → Failover` → `Enter` → 输入逗号分隔的名称 → `Enter`。
-或使用 CLI：
-```bash
-pi-switch proxy failover provider-b,provider-c
+TUI 中：`Settings → Failover rules` → `Enter`。每条规则将匹配条件
+（`modelPrefix` / `modelContains`，AND 组合）与有序 provider 链配对：
+
+```json
+{
+  "match": { "modelPrefix": "deepseek" },
+  "providers": ["deepseek-a", "deepseek-b"]
+}
 ```
 
-暴露了相同模型的 failover 链中的 provider 会在主 provider 失败时按顺序尝试。
+或使用 CLI：
+```bash
+pi-switch proxy rules set '[{"match":{"modelPrefix":"deepseek"},"providers":["deepseek-a","deepseek-b"]}]'
+```
+
+第一条匹配的规则生效，其 providers 按顺序在主 provider 失败时尝试。
+规则针对请求的模型 id（`profile/` 之后的部分）进行匹配。
 
 </details>
 
@@ -325,15 +337,15 @@ pi-switch proxy failover provider-b,provider-c
 
 1. 按第一个 `/` 拆分 — profile `provider-a`，真实模型 `gpt-5.4`
 2. 路由到 `provider-a` profile 的上游，将 `body.model` 改为 `gpt-5.4`
-3. 失败（429/5xx）时，在 failover 链中寻找其他暴露了 `gpt-5.4` 的 profile
+3. 失败（429/5xx）时，按第一条匹配规则的 provider 链转移（无规则命中时回退到其他暴露了 `gpt-5.4` 的 profile）
 
 ```bash
 # 1. 暴露模型（按 profile）
 pi-switch provider expose provider-a gpt-5.4
 pi-switch provider expose provider-b gpt-5.4
 
-# 2. 设置故障转移链（可选）
-pi-switch proxy failover provider-b
+# 2. 设置故障转移规则（可选）
+pi-switch proxy rules set '[{"match":{"modelPrefix":"gpt"},"providers":["provider-a","provider-b"]}]'
 
 # 3. 启动代理守护进程
 pi-switch proxy start --daemon

@@ -119,7 +119,7 @@ change only if the feature has a TUI screen.
 | `POST /api/profiles/:name/{duplicate,use,test,fetch-models}` | `ops::{duplicate_profile,use_profile,test_provider,fetch_models}` |
 | `PUT /api/profiles/:name/{models,expose,spoof}` | `ops::{update_provider_models,update_exposed_models,set_profile_spoof}` |
 | `POST /api/proxy/{start,stop}` | `daemon::daemon_{start,stop}(&PROXY, …)` |
-| `PUT /api/proxy/failover` | `ops::set_failover` |
+| `PUT /api/proxy/rules` | `ops::set_rules` |
 | `PUT /api/settings` | `ops::update_settings` |
 | `POST /api/config/{export,import,restore}` | `sync::{encrypt_config,import_config}` · `config::restore_config` |
 | `POST /api/init` | `ops::init` |

@@ -86,7 +86,9 @@ pi-switch provider expose <name> <model-ids...>    # Expose models to pi agent
 pi-switch provider fetch-models <name>             # Fetch models from API
 
 # Proxy (gateway)
-pi-switch proxy failover <p1,p2,...>               # Same-model fallback chain
+pi-switch proxy rules list                              # Show failover rules
+pi-switch proxy rules set '<json>'                     # Set failover rules (rule-based, provider-level)
+pi-switch proxy rules clear                            # Remove all failover rules
 pi-switch proxy start --daemon                     # Start proxy daemon
 pi-switch proxy status
 
@@ -177,7 +179,7 @@ graph LR
     subgraph Setup["⚙️ Setup"]
         A[Add Provider] --> B[Configure Models]
         B --> C[Expose to Pi]
-        C --> D[Set Failover Chain]
+        C --> D[Set Failover Rules]
     end
 
     subgraph Runtime["🚀 Runtime"]
@@ -220,7 +222,7 @@ In TUI: `Profiles → select provider → x`
 
 **3. Start the proxy** — it writes a single `pi-switch` gateway provider to pi
 ```bash
-pi-switch proxy failover provider-b,provider-c          # optional same-model fallback
+pi-switch proxy rules set '[{"match":{"modelPrefix":"gpt"},"providers":["provider-a","provider-b"]}]'  # optional rule-based failover
 pi-switch proxy start --daemon
 ```
 
@@ -232,7 +234,7 @@ Requests are routed by the model name in the request body — no out-of-band sta
 
 - **Model-name routing** — `"model": "provider-a/gpt-5.4"` resolves to profile `provider-a`, real model `gpt-5.4`; the proxy rewrites the body before forwarding upstream
 - **Single gateway provider** — pi sees one `pi-switch` provider advertising every exposed model as `profile/realModelId`; switching model in pi = sending a different model string = instant routing change
-- **Automatic failover** — same-model fallback across the configured chain on 429/5xx errors or network failures
+- **Rule-based failover** — the first rule whose match conditions hit the requested model decides the provider chain, tried in order on 429/5xx errors or network failures (provider-level granularity; providers may map the model via `modelMap`)
 - **Circuit breaker** — after 3 consecutive failures, provider enters 60s cooldown; auto-recovery on half-open probe success
 - **Streaming (SSE)** — same-format requests (openai→openai, anthropic→anthropic) stream token-by-token; upstream response headers (Content-Type, etc.) are preserved
 - **OpenAI ↔ Anthropic** — transparently converts between chat completions and messages APIs
@@ -296,13 +298,23 @@ pi-switch provider expose <name> <model-id>...
 <summary><b>How do I set up failover?</b></summary>
 <br>
 
-In TUI: `Settings → Failover` → `Enter` → enter comma-separated profile names → `Enter`.
-Or via CLI:
-```bash
-pi-switch proxy failover provider-b,provider-c
+In TUI: `Settings → Failover rules` → `Enter`. Each rule pairs match conditions
+(`modelPrefix` / `modelContains`, ANDed) with an ordered provider chain:
+
+```json
+{
+  "match": { "modelPrefix": "deepseek" },
+  "providers": ["deepseek-a", "deepseek-b"]
+}
 ```
 
-Profiles in the failover chain that expose the same model are tried in order when the primary fails.
+Or via CLI:
+```bash
+pi-switch proxy rules set '[{"match":{"modelPrefix":"deepseek"},"providers":["deepseek-a","deepseek-b"]}]'
+```
+
+The first matching rule wins; its providers are tried in order when the primary fails.
+Rules are matched against the requested model id (the part after `profile/`).
 
 </details>
 
@@ -326,15 +338,16 @@ The proxy advertises every exposed model as `profile/realModelId` under a single
 
 1. Splits on the first `/` — profile `provider-a`, real model `gpt-5.4`
 2. Routes to the `provider-a` profile's upstream, rewriting `body.model` to `gpt-5.4`
-3. On failure (429/5xx), tries the failover chain for any other profile exposing `gpt-5.4`
+3. On failure (429/5xx), follows the first matching rule's provider chain (or falls back
+to any other profile exposing `gpt-5.4` when no rule matches)
 
 ```bash
 # 1. Expose models (per profile)
 pi-switch provider expose provider-a gpt-5.4
 pi-switch provider expose provider-b gpt-5.4
 
-# 2. Set failover chain (optional)
-pi-switch proxy failover provider-b
+# 2. Set failover rules (optional)
+pi-switch proxy rules set '[{"match":{"modelPrefix":"gpt"},"providers":["provider-a","provider-b"]}]'
 
 # 3. Start proxy daemon
 pi-switch proxy start --daemon

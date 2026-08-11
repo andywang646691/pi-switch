@@ -13,6 +13,66 @@ use super::theme::{theme, Theme};
 
 pub const TOAST_TICKS: u16 = 12;
 
+/// One rule being edited in the TUI rules editor. Mirrors `config::FailoverRule`
+/// with the match conditions kept as plain strings for text editing.
+#[derive(Debug, Clone, Default)]
+pub struct RuleDraft {
+    pub name: String,
+    pub prefix: String,
+    pub contains: String,
+    pub providers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulesEditMode {
+    /// Browsing the rule list
+    List,
+    /// Editing the rule name / match prefix / match contains text field
+    Text,
+    /// Editing the provider chain (checkbox + sortable list)
+    Providers,
+}
+
+impl Default for RulesEditMode {
+    fn default() -> Self {
+        RulesEditMode::List
+    }
+}
+
+/// Which text field is being edited when `RulesEditMode::Text`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulesTextField {
+    Name,
+    Prefix,
+    Contains,
+}
+
+#[derive(Debug, Clone)]
+pub struct RulesEditorState {
+    pub rules: Vec<RuleDraft>,
+    pub idx: usize,
+    pub mode: RulesEditMode,
+    pub field: RulesTextField,
+    pub input: TextInput,
+    /// Provider chain editing: (profile_name, selected), selected ones in order.
+    pub providers: Vec<(String, bool)>,
+    pub provider_idx: usize,
+}
+
+impl Default for RulesEditorState {
+    fn default() -> Self {
+        Self {
+            rules: vec![],
+            idx: 0,
+            mode: RulesEditMode::List,
+            field: RulesTextField::Name,
+            input: TextInput::default(),
+            providers: vec![],
+            provider_idx: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Nav,
@@ -116,9 +176,8 @@ pub struct App {
     pub model_selection_idx: usize,
     pub model_selection_loading: bool,
     pub fetch_rx: Option<mpsc::Receiver<FetchModelsMessage>>,
-    // Failover editor state
-    pub failover_list: Vec<(String, bool)>, // (provider_name, selected)
-    pub failover_idx: usize,
+    // Rules editor state
+    pub rules_editor: RulesEditorState,
     // Packages state
     pub packages_idx: usize,
     // cc-switch import state
@@ -198,8 +257,7 @@ impl App {
             model_selection_idx: 0,
             model_selection_loading: false,
             fetch_rx: None,
-            failover_list: vec![],
-            failover_idx: 0,
+            rules_editor: RulesEditorState::default(),
             packages_idx: 0,
             ccswitch_list: vec![],
             ccswitch_idx: 0,
@@ -581,7 +639,7 @@ impl App {
             Route::Stats => self.on_stats_key(key),
             Route::Backups => self.on_backups_key(key),
             Route::Settings => self.on_settings_key(key),
-            Route::FailoverEditor => self.on_failover_editor_key(key),
+            Route::RulesEditor => self.on_rules_editor_key(key),
             Route::Form => {}
         }
     }
@@ -991,7 +1049,7 @@ impl App {
             return;
         }
 
-        let row_count = 5; // Language + host + port + user-agent + failover
+        let row_count = 5; // Language + host + port + user-agent + rules
         match key.code {
             KeyCode::Up => {
                 self.settings_proxy_idx = self.settings_proxy_idx.saturating_sub(1);
@@ -1048,8 +1106,8 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.settings_proxy_idx == 4 {
-                    // Open failover editor
-                    self.open_failover_editor();
+                    // Open rules editor
+                    self.open_rules_editor();
                 } else if self.settings_proxy_idx == 1 || self.settings_proxy_idx == 2 {
                     // Host / port text fields
                     let text = self.get_settings_field_value(self.settings_proxy_idx);
@@ -1074,10 +1132,10 @@ impl App {
             2 => proxy.port.to_string(),
             3 => proxy.user_agent.as_deref().unwrap_or("").to_string(),
             4 => {
-                if proxy.failover.is_empty() {
+                if proxy.rules.is_empty() {
                     String::new()
                 } else {
-                    proxy.failover.join(", ")
+                    format!("{} rule(s)", proxy.rules.len())
                 }
             }
             _ => String::new(),
@@ -1120,24 +1178,41 @@ impl App {
         }
     }
 
-    fn open_failover_editor(&mut self) {
-        // Load all non-proxy profiles as candidates
-        let current_failover = &self.data.config.settings.proxy.failover;
-
-        // Build list: start with selected (in order), then unselected
-        let mut list = Vec::new();
-
-        // First add selected ones in their current order
-        for name in current_failover {
-            if self.data.config.profiles.contains_key(name) {
-                list.push((name.clone(), true));
-            }
+    fn open_rules_editor(&mut self) {
+        // Load rules from config as drafts; keep a fresh provider checklist per rule.
+        let mut rules = Vec::new();
+        for rule in &self.data.config.settings.proxy.rules {
+            rules.push(RuleDraft {
+                name: rule.name.clone().unwrap_or_default(),
+                prefix: rule.r#match.model_prefix.clone().unwrap_or_default(),
+                contains: rule.r#match.model_contains.clone().unwrap_or_default(),
+                providers: rule.providers.clone(),
+            });
         }
+        self.rules_editor.rules = rules;
+        self.rules_editor.idx = 0;
+        self.rules_editor.mode = RulesEditMode::List;
+        self.rules_editor.providers = vec![];
+        self.route = Route::RulesEditor;
+    }
 
-        // Then add unselected ones (non-proxy profiles not in failover)
+    /// The ordered provider checklist for `idx`: selected (in chain order) first,
+    /// then every unselected non-proxy profile.
+    fn rules_provider_checklist(&self, idx: usize) -> Vec<(String, bool)> {
+        let providers = self
+            .rules_editor
+            .rules
+            .get(idx)
+            .map(|r| r.providers.clone())
+            .unwrap_or_default();
+        let mut list: Vec<(String, bool)> = providers
+            .iter()
+            .filter(|p| self.data.config.profiles.contains_key(*p))
+            .map(|p| (p.clone(), true))
+            .collect();
         for (name, profile) in &self.data.config.profiles {
-            if current_failover.contains(name) {
-                continue; // Already added
+            if list.iter().any(|(n, _)| n == name) {
+                continue;
             }
             let is_proxy = profile
                 .get("proxy")
@@ -1147,61 +1222,211 @@ impl App {
                 list.push((name.clone(), false));
             }
         }
-
-        self.failover_list = list;
-        self.failover_idx = 0;
-        self.route = Route::FailoverEditor;
+        list
     }
 
-    fn on_failover_editor_key(&mut self, key: KeyEvent) {
+    fn on_rules_editor_key(&mut self, key: KeyEvent) {
         if self.back_to_nav_on_esc(&key) {
             self.route = Route::Settings;
             return;
         }
 
-        let len = self.failover_list.len();
-        if len == 0 {
+        let key = Self::normalize_key(key);
+
+        // Text editing mode (name / prefix / contains)
+        if self.rules_editor.mode == RulesEditMode::Text {
+            match key.code {
+                KeyCode::Esc => {
+                    self.rules_editor.mode = RulesEditMode::List;
+                }
+                KeyCode::Enter => {
+                    self.commit_rules_text_field();
+                    self.rules_editor.mode = RulesEditMode::List;
+                }
+                _ => {
+                    self.rules_editor.input.apply_key(key);
+                }
+            }
             return;
         }
 
+        // Provider chain editing mode
+        if self.rules_editor.mode == RulesEditMode::Providers {
+            self.on_rules_providers_key(key);
+            return;
+        }
+
+        // List mode
+        if self.rules_editor.rules.is_empty() {
+            match key.code {
+                KeyCode::Char('i') => self.add_rule_draft(),
+                KeyCode::Enter | KeyCode::Char('s') => self.save_rules_config(),
+                _ => {}
+            }
+            return;
+        }
+
+        let len = self.rules_editor.rules.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.failover_idx = self.failover_idx.saturating_sub(1);
+                self.rules_editor.idx = self.rules_editor.idx.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j')
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.failover_idx = (self.failover_idx + 1).min(len - 1);
-            }
-            KeyCode::Char(' ') => {
-                // Toggle selection
-                self.failover_list[self.failover_idx].1 = !self.failover_list[self.failover_idx].1;
+                self.rules_editor.idx = (self.rules_editor.idx + 1).min(len - 1);
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Move item up
-                if self.failover_idx > 0 {
-                    self.failover_list
-                        .swap(self.failover_idx, self.failover_idx - 1);
-                    self.failover_idx -= 1;
+                if self.rules_editor.idx > 0 {
+                    self.rules_editor.rules.swap(
+                        self.rules_editor.idx,
+                        self.rules_editor.idx - 1,
+                    );
+                    self.rules_editor.idx -= 1;
                 }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Move item down
-                if self.failover_idx < len - 1 {
-                    self.failover_list
-                        .swap(self.failover_idx, self.failover_idx + 1);
-                    self.failover_idx += 1;
+                if self.rules_editor.idx < len - 1 {
+                    self.rules_editor.rules.swap(
+                        self.rules_editor.idx,
+                        self.rules_editor.idx + 1,
+                    );
+                    self.rules_editor.idx += 1;
                 }
             }
+            KeyCode::Char('i') => {
+                // Insert a new rule after the current one
+                self.add_rule_draft();
+            }
+            KeyCode::Char('d') => {
+                self.rules_editor.rules.remove(self.rules_editor.idx);
+                if !self.rules_editor.rules.is_empty() {
+                    self.rules_editor.idx = self
+                        .rules_editor
+                        .idx
+                        .min(self.rules_editor.rules.len() - 1);
+                }
+            }
+            KeyCode::Char('n') => {
+                // Edit rule name
+                let text = self
+                    .rules_editor
+                    .rules
+                    .get(self.rules_editor.idx)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                self.rules_editor.field = RulesTextField::Name;
+                self.rules_editor.input = TextInput::new(text);
+                self.rules_editor.mode = RulesEditMode::Text;
+            }
+            KeyCode::Char('e') => {
+                // Edit match conditions (prefix / contains)
+                let rule = &self.rules_editor.rules[self.rules_editor.idx];
+                if rule.prefix.is_empty() {
+                    self.rules_editor.field = RulesTextField::Prefix;
+                    self.rules_editor.input = TextInput::new(String::new());
+                } else {
+                    self.rules_editor.field = RulesTextField::Contains;
+                    self.rules_editor.input = TextInput::new(rule.contains.clone());
+                }
+                self.rules_editor.mode = RulesEditMode::Text;
+            }
+            KeyCode::Char('p') => {
+                // Edit provider chain
+                self.rules_editor.providers =
+                    self.rules_provider_checklist(self.rules_editor.idx);
+                self.rules_editor.provider_idx = 0;
+                self.rules_editor.mode = RulesEditMode::Providers;
+            }
             KeyCode::Enter | KeyCode::Char('s') => {
-                // Save failover configuration
-                self.save_failover_config();
+                self.save_rules_config();
             }
             _ => {}
         }
     }
 
-    fn save_failover_config(&mut self) {
+    fn on_rules_providers_key(&mut self, key: KeyEvent) {
+        let len = self.rules_editor.providers.len();
+        if len == 0 {
+            self.rules_editor.mode = RulesEditMode::List;
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.rules_editor.mode = RulesEditMode::List;
+            }
+            KeyCode::Up | KeyCode::Char('k')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.rules_editor.provider_idx = self.rules_editor.provider_idx.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.rules_editor.provider_idx =
+                    (self.rules_editor.provider_idx + 1).min(len - 1);
+            }
+            KeyCode::Char(' ') => {
+                let selected = &mut self.rules_editor.providers[self.rules_editor.provider_idx];
+                selected.1 = !selected.1;
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.rules_editor.provider_idx > 0 {
+                    self.rules_editor.providers.swap(
+                        self.rules_editor.provider_idx,
+                        self.rules_editor.provider_idx - 1,
+                    );
+                    self.rules_editor.provider_idx -= 1;
+                }
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.rules_editor.provider_idx < len - 1 {
+                    self.rules_editor.providers.swap(
+                        self.rules_editor.provider_idx,
+                        self.rules_editor.provider_idx + 1,
+                    );
+                    self.rules_editor.provider_idx += 1;
+                }
+            }
+            KeyCode::Enter => {
+                // Commit the provider chain back to the draft
+                let providers: Vec<String> = self
+                    .rules_editor
+                    .providers
+                    .iter()
+                    .filter(|(_, selected)| *selected)
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if let Some(rule) = self.rules_editor.rules.get_mut(self.rules_editor.idx) {
+                    rule.providers = providers;
+                }
+                self.rules_editor.mode = RulesEditMode::List;
+            }
+            _ => {}
+        }
+    }
+
+    fn add_rule_draft(&mut self) {
+        let idx = self.rules_editor.idx;
+        self.rules_editor.rules.insert(idx + 1, RuleDraft::default());
+        self.rules_editor.idx = idx + 1;
+        self.rules_editor.field = RulesTextField::Name;
+        self.rules_editor.input = TextInput::new(String::new());
+        self.rules_editor.mode = RulesEditMode::Text;
+    }
+
+    fn commit_rules_text_field(&mut self) {
+        let value = self.rules_editor.input.value.trim().to_string();
+        if let Some(rule) = self.rules_editor.rules.get_mut(self.rules_editor.idx) {
+            match self.rules_editor.field {
+                RulesTextField::Name => rule.name = value,
+                RulesTextField::Prefix => rule.prefix = value,
+                RulesTextField::Contains => rule.contains = value,
+            }
+        }
+    }
+
+    fn save_rules_config(&mut self) {
         let mut config = match crate::config::load_config() {
             Ok(c) => c,
             Err(e) => {
@@ -1210,15 +1435,33 @@ impl App {
             }
         };
 
-        // Collect selected items in order
-        let failover: Vec<String> = self
-            .failover_list
+        let rules: Vec<crate::config::FailoverRule> = self
+            .rules_editor
+            .rules
             .iter()
-            .filter(|(_, selected)| *selected)
-            .map(|(name, _)| name.clone())
+            .map(|r| crate::config::FailoverRule {
+                name: if r.name.is_empty() {
+                    None
+                } else {
+                    Some(r.name.clone())
+                },
+                r#match: crate::config::RuleMatch {
+                    model_prefix: if r.prefix.is_empty() {
+                        None
+                    } else {
+                        Some(r.prefix.clone())
+                    },
+                    model_contains: if r.contains.is_empty() {
+                        None
+                    } else {
+                        Some(r.contains.clone())
+                    },
+                },
+                providers: r.providers.clone(),
+            })
             .collect();
 
-        config.settings.proxy.failover = failover;
+        config.settings.proxy.rules = rules;
 
         match crate::config::save_config(&config) {
             Ok(()) => {

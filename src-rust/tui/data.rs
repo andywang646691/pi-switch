@@ -68,8 +68,8 @@ pub struct ProfileRow {
     pub provider_id: String,
     pub proxy: bool,
     pub exposed_count: usize,
-    pub in_failover_chain: bool,
-    pub failover_priority: Option<usize>, // 0=target, 1=p1, 2=p2, ...
+    pub in_rules: bool,
+    pub failover_priority: Option<usize>, // first position across rule chains
     pub circuit_breaker_open: bool,
     /// Last circuit breaker error (e.g. "HTTP 502"), used for status display.
     pub circuit_breaker_error: Option<String>,
@@ -96,7 +96,7 @@ fn offline_daemon(message: String) -> DaemonResult {
         host: None,
         port: None,
         targets: None,
-        failover: None,
+        rules: None,
         started_at: None,
         message,
     }
@@ -130,13 +130,17 @@ fn list_backup_files() -> Vec<String> {
 }
 
 fn profile_rows(config: &PiSwitchConfig, stats: &UsageStats) -> Vec<ProfileRow> {
-    // Build failover priority map — only from the failover chain.
-    // (proxy.target is deprecated in gateway mode; routing is by model name.)
-    let failover_chain = &config.settings.proxy.failover;
-
+    // Rules are the failover mechanism; a profile's priority is the first position
+    // at which it appears across all rule provider chains.
     let mut priority_map = std::collections::HashMap::new();
-    for (idx, name) in failover_chain.iter().enumerate() {
-        priority_map.insert(name.clone(), idx);
+    let mut next = 0usize;
+    for rule in &config.settings.proxy.rules {
+        for name in &rule.providers {
+            if !priority_map.contains_key(name) {
+                priority_map.insert(name.clone(), next);
+                next += 1;
+            }
+        }
     }
 
     config
@@ -150,7 +154,7 @@ fn profile_rows(config: &PiSwitchConfig, stats: &UsageStats) -> Vec<ProfileRow> 
                 .unwrap_or(false);
 
             let priority = priority_map.get(name).copied();
-            let in_failover_chain = priority.is_some();
+            let in_rules = priority.is_some();
 
             // Check circuit breaker status
             let cb_status = stats.circuit_breaker.get(name);
@@ -188,7 +192,7 @@ fn profile_rows(config: &PiSwitchConfig, stats: &UsageStats) -> Vec<ProfileRow> 
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0),
-                in_failover_chain,
+                in_rules,
                 failover_priority: priority,
                 circuit_breaker_open,
                 circuit_breaker_error,

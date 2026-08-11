@@ -68,7 +68,7 @@ export function defaultConfig() {
         host: "127.0.0.1",
         port: 43112,
         target: null,
-        failover: [],
+        rules: [],
         circuitBreaker: {
           enabled: true,
           failureThreshold: 3,
@@ -91,7 +91,7 @@ export async function loadConfig() {
   config.settings.proxy.host ??= "127.0.0.1";
   config.settings.proxy.port ??= 43112;
   config.settings.proxy.target ??= null;
-  config.settings.proxy.failover ??= [];
+  config.settings.proxy.rules ??= [];
   config.settings.proxy.circuitBreaker ??= {};
   config.settings.proxy.circuitBreaker.enabled ??= true;
   config.settings.proxy.circuitBreaker.failureThreshold ??= 3;

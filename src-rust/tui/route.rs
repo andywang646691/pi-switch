@@ -13,7 +13,7 @@ pub enum Route {
     Stats,
     Backups,
     Settings,
-    FailoverEditor, // Edit failover chain with checkbox+sortable list
+    RulesEditor, // Edit failover rules (match conditions + provider chains)
     Form,
 }
 

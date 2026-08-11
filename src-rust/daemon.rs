@@ -134,7 +134,7 @@ pub struct DaemonResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failover: Option<Vec<String>>,
+    pub rules: Option<Vec<crate::config::FailoverRule>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "startedAt")]
     pub started_at: Option<u64>,
@@ -254,7 +254,7 @@ pub fn daemon_start(
                 host: Some(info.host),
                 port: Some(info.port),
                 targets: None,
-                failover: None,
+                rules: None,
                 started_at: None,
                 message: msg,
             });
@@ -358,7 +358,7 @@ pub fn daemon_start(
         host: Some(host.clone()),
         port: Some(port),
         targets: None,
-        failover: None,
+        rules: None,
         started_at: Some(now_ms),
         message: format!(
             "{} daemon started (PID {}) on http://{}:{}",
@@ -379,7 +379,7 @@ pub fn daemon_stop(service: &Service) -> Result<DaemonResult, String> {
                 host: None,
                 port: None,
                 targets: None,
-                failover: None,
+                rules: None,
                 started_at: None,
                 message: format!("No {} daemon PID file found", service.label),
             });
@@ -394,7 +394,7 @@ pub fn daemon_stop(service: &Service) -> Result<DaemonResult, String> {
             host: None,
             port: None,
             targets: None,
-            failover: None,
+            rules: None,
             started_at: None,
             message: format!("PID {} is not alive (cleaned up stale PID)", info.pid),
         });
@@ -413,7 +413,7 @@ pub fn daemon_stop(service: &Service) -> Result<DaemonResult, String> {
                 host: None,
                 port: None,
                 targets: None,
-                failover: None,
+                rules: None,
                 started_at: None,
                 message: format!("{} daemon (PID {}) stopped", service.label, info.pid),
             });
@@ -429,7 +429,7 @@ pub fn daemon_stop(service: &Service) -> Result<DaemonResult, String> {
         host: None,
         port: None,
         targets: None,
-        failover: None,
+        rules: None,
         started_at: None,
         message: format!("{} daemon (PID {}) force killed", service.label, info.pid),
     })
@@ -447,7 +447,7 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
                 host: None,
                 port: None,
                 targets: None,
-                failover: None,
+                rules: None,
                 started_at: None,
                 message: format!("{} daemon is not running (no PID file)", service.label),
             });
@@ -464,7 +464,7 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
                 host: None,
                 port: None,
                 targets: None,
-                failover: None,
+                rules: None,
                 started_at: None,
                 message: format!(
                     "{} daemon process exists (PID {}) but port {}:{} is not responding. Cleaned up stale PID.",
@@ -473,8 +473,8 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
             });
         }
 
-        // targets/failover only apply to the proxy; the web UI has neither.
-        let (targets, failover) = if service.subcommand == "proxy" {
+        // targets/rules only apply to the proxy; the web UI has neither.
+        let (targets, rules) = if service.subcommand == "proxy" {
             let proxy = load_config().map(|c| c.settings.proxy).unwrap_or_default();
             let targets: Vec<String> = load_config()
                 .ok()
@@ -492,10 +492,10 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let failover = if proxy.failover.is_empty() {
+            let rules = if proxy.rules.is_empty() {
                 None
             } else {
-                Some(proxy.failover.clone())
+                Some(proxy.rules.clone())
             };
             (
                 if targets.is_empty() {
@@ -503,7 +503,7 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
                 } else {
                     Some(targets)
                 },
-                failover,
+                rules,
             )
         } else {
             (None, None)
@@ -515,7 +515,7 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
             host: Some(info.host.clone()),
             port: Some(info.port),
             targets,
-            failover,
+            rules,
             started_at: Some(info.started_at),
             message: format!(
                 "{} daemon is running (PID {}) on http://{}:{}",
@@ -530,7 +530,7 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
             host: None,
             port: None,
             targets: None,
-            failover: None,
+            rules: None,
             started_at: None,
             message: format!("PID {} is not alive (cleaned up stale PID)", info.pid),
         })

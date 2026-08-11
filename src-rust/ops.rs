@@ -37,32 +37,48 @@ pub fn init() -> Result<Vec<String>> {
     Ok(messages)
 }
 
-/// Set the same-model failover chain. Validates every profile exists and is not a proxy
-/// profile. Shared by the CLI (napi) and the web `PUT /api/proxy/failover`.
-pub fn set_failover(failover_profiles: Vec<String>) -> Result<Option<PathBuf>> {
+/// Set the failover rules. Validates each provider exists and is not a proxy profile,
+/// and that every rule has match conditions plus a non-empty provider chain.
+/// Shared by the CLI (napi) and the web `PUT /api/proxy/rules`.
+pub fn set_rules(rules: Vec<crate::config::FailoverRule>) -> Result<Option<PathBuf>> {
     let mut config = load_config()?;
 
-    for name in &failover_profiles {
-        if !config.profiles.contains_key(name) {
+    for (i, rule) in rules.iter().enumerate() {
+        if rule.r#match.is_empty() {
             return Err(AppError::Message(format!(
-                "Profile '{}' does not exist",
-                name
+                "Rule {} has no match conditions (set modelPrefix and/or modelContains)",
+                i + 1
             )));
         }
-        if let Some(profile_value) = config.profiles.get(name) {
-            if let Ok(profile) = serde_json::from_value::<ProviderProfile>(profile_value.clone()) {
-                if profile.proxy {
-                    return Err(AppError::Message(format!(
-                        "Cannot use proxy profile '{}' in failover chain",
-                        name
-                    )));
+        if rule.providers.is_empty() {
+            return Err(AppError::Message(format!(
+                "Rule {} has no providers",
+                i + 1
+            )));
+        }
+        for name in &rule.providers {
+            if !config.profiles.contains_key(name) {
+                return Err(AppError::Message(format!(
+                    "Rule {} provider '{}' does not exist",
+                    i + 1,
+                    name
+                )));
+            }
+            if let Some(profile_value) = config.profiles.get(name) {
+                if let Ok(profile) = serde_json::from_value::<ProviderProfile>(profile_value.clone()) {
+                    if profile.proxy {
+                        return Err(AppError::Message(format!(
+                            "Cannot use proxy profile '{}' as rule provider",
+                            name
+                        )));
+                    }
                 }
             }
         }
     }
 
     let backup = backup_config("config")?;
-    config.settings.proxy.failover = failover_profiles;
+    config.settings.proxy.rules = rules;
     save_config(&config)?;
     Ok(backup)
 }

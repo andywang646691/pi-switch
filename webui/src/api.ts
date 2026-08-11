@@ -11,6 +11,7 @@ import type {
   PresetInfo,
   ProfileDetail,
   ProviderProfile,
+  FailoverRule,
   TestResult,
   UsageStats,
   ValidationIssue,
@@ -111,7 +112,7 @@ export const api = {
   proxyStart: (host?: string, port?: number) =>
     req<DaemonResult>("POST", "/proxy/start", { host, port }),
   proxyStop: () => req<DaemonResult>("POST", "/proxy/stop"),
-  setFailover: (failover: string[]) => req("PUT", "/proxy/failover", { failover }),
+  setRules: (rules: FailoverRule[]) => req("PUT", "/proxy/rules", { rules }),
   updateSettings: (settings: AppState["settings"]) => req("PUT", "/settings", settings),
   exportConfig: (passphrase: string) =>
     req<{ path: string }>("POST", "/config/export", { passphrase }),

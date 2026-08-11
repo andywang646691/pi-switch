@@ -24,7 +24,7 @@ export function HomePanel({
   const workflow = [
     "Add profiles & set API keys",
     "Expose models to pi (per profile)",
-    "Optionally set a failover chain",
+    "Optionally set failover rules",
     "Start the proxy — pi routes by profile/model",
   ];
 

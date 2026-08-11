@@ -254,10 +254,10 @@ pub(super) fn render_proxy(frame: &mut Frame<'_>, app: &App, area: Rect) {
     status_lines.push(label_line(
         app,
         i18n::proxy_failover(),
-        if proxy.failover.is_empty() {
+        if proxy.rules.is_empty() {
             "—".into()
         } else {
-            proxy.failover.join(" → ")
+            format!("{} rule(s)", proxy.rules.len())
         },
     ));
 
@@ -302,7 +302,7 @@ pub(super) fn render_proxy(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::raw(format!("{} ", row.name)),
         ];
-        if row.in_failover_chain {
+        if row.in_rules {
             if let Some(p) = row.failover_priority {
                 spans.push(Span::styled(
                     format!("[p{}]", p),
@@ -744,10 +744,10 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
     render_key_bar_center(frame, theme, chunks[0], key_hints);
 
     let proxy = &app.data.config.settings.proxy;
-    let failover_str = if proxy.failover.is_empty() {
+    let rules_str = if proxy.rules.is_empty() {
         "—".to_string()
     } else {
-        proxy.failover.join(", ")
+        format!("{} rule(s)", proxy.rules.len())
     };
 
     // Disguise preset display
@@ -776,7 +776,7 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
             },
             user_agent_display,
         ),
-        (i18n::settings_proxy_failover(), failover_str),
+        (i18n::settings_proxy_failover(), rules_str),
     ];
 
     let label_width = rows_data
@@ -923,14 +923,15 @@ fn range_label(range: &crate::tui::data::StatsRange) -> &'static str {
     }
 }
 
-pub(super) fn render_failover_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
+pub(super) fn render_rules_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let theme = &app.theme;
+    let editor = &app.rules_editor;
     let block = content_block(
         app,
         if i18n::is_zh() {
-            "故障转移链编辑"
+            "故障转移规则编辑"
         } else {
-            "Failover Chain Editor"
+            "Failover Rules Editor"
         },
     );
     let inner = block.inner(area);
@@ -941,22 +942,104 @@ pub(super) fn render_failover_editor(frame: &mut Frame<'_>, app: &App, area: Rec
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
+    // Provider chain editing sub-view
+    if editor.mode == crate::tui::app::RulesEditMode::Providers {
+        let key_hints: &[(&str, &str)] = &[
+            ("↑↓", i18n::key_move()),
+            ("Space", if i18n::is_zh() { "勾选" } else { "Toggle" }),
+            ("Ctrl+j/k", if i18n::is_zh() { "移动" } else { "Move" }),
+            ("Enter", if i18n::is_zh() { "完成" } else { "Done" }),
+            ("Esc", i18n::key_back()),
+        ];
+        render_key_bar_center(frame, theme, chunks[0], key_hints);
+
+        let items: Vec<ListItem<'_>> = editor
+            .providers
+            .iter()
+            .map(|(name, selected)| {
+                let checkbox = if *selected { "[✓]" } else { "[ ]" };
+                ListItem::new(format!("  {} {}", checkbox, name))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(selection_style(theme))
+            .highlight_symbol(highlight_symbol(theme));
+        let mut state = ListState::default();
+        state.select(Some(editor.provider_idx));
+        frame.render_stateful_widget(list, chunks[1], &mut state);
+        return;
+    }
+
+    // Text field editing sub-view (name / prefix / contains)
+    if editor.mode == crate::tui::app::RulesEditMode::Text {
+        let field_label = match editor.field {
+            crate::tui::app::RulesTextField::Name => {
+                if i18n::is_zh() {
+                    "规则名称"
+                } else {
+                    "Rule name"
+                }
+            }
+            crate::tui::app::RulesTextField::Prefix => {
+                if i18n::is_zh() {
+                    "模型名前缀"
+                } else {
+                    "Model prefix"
+                }
+            }
+            crate::tui::app::RulesTextField::Contains => {
+                if i18n::is_zh() {
+                    "模型名包含"
+                } else {
+                    "Model contains"
+                }
+            }
+        };
+        let key_hints: &[(&str, &str)] = &[("Enter", i18n::key_save()), ("Esc", i18n::key_back())];
+        render_key_bar_center(frame, theme, chunks[0], key_hints);
+
+        let prompt = if i18n::is_zh() {
+            format!("{}: ", field_label)
+        } else {
+            format!("{}: ", field_label)
+        };
+        let text = format!("{}{}", prompt, editor.input.value);
+        let (visible, _) = crate::tui::text_edit::visible_text_window(
+            &text,
+            editor.input.cursor + prompt.chars().count() as usize,
+            chunks[1].width.max(1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                visible,
+                Style::default().fg(theme.accent),
+            ))),
+            chunks[1],
+        );
+        return;
+    }
+
+    // Rule list view
     let key_hints: &[(&str, &str)] = &[
         ("↑↓", i18n::key_move()),
-        ("Space", if i18n::is_zh() { "勾选" } else { "Toggle" }),
         ("Ctrl+j/k", if i18n::is_zh() { "移动" } else { "Move" }),
-        ("Enter/s", i18n::key_save()),
+        ("n", if i18n::is_zh() { "名称" } else { "Name" }),
+        ("e", if i18n::is_zh() { "匹配条件" } else { "Match" }),
+        ("p", if i18n::is_zh() { "供应商链" } else { "Providers" }),
+        ("i", if i18n::is_zh() { "新增" } else { "Insert" }),
+        ("d", if i18n::is_zh() { "删除" } else { "Delete" }),
+        ("s", i18n::key_save()),
         ("Esc", i18n::key_back()),
     ];
     render_key_bar_center(frame, theme, chunks[0], key_hints);
 
-    if app.failover_list.is_empty() {
+    if editor.rules.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 if i18n::is_zh() {
-                    "无可用的供应商"
+                    "暂无规则 — 按 i 新增，或按 s 保存空列表"
                 } else {
-                    "No available providers"
+                    "No rules — press i to add one, or s to save the empty list"
                 },
                 Style::default().fg(theme.dim),
             ))),
@@ -965,14 +1048,36 @@ pub(super) fn render_failover_editor(frame: &mut Frame<'_>, app: &App, area: Rec
         return;
     }
 
-    // Render list with checkboxes
-    let items: Vec<ListItem<'_>> = app
-        .failover_list
+    let items: Vec<ListItem<'_>> = editor
+        .rules
         .iter()
-        .map(|(name, selected)| {
-            let checkbox = if *selected { "[✓]" } else { "[ ]" };
-            let text = format!("  {} {}", checkbox, name);
-            ListItem::new(text)
+        .map(|rule| {
+            let name = if rule.name.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                rule.name.clone()
+            };
+            let mut conditions: Vec<String> = Vec::new();
+            if !rule.prefix.is_empty() {
+                conditions.push(format!("prefix:{}", rule.prefix));
+            }
+            if !rule.contains.is_empty() {
+                conditions.push(format!("contains:{}", rule.contains));
+            }
+            let match_str = if conditions.is_empty() {
+                "match:*".to_string()
+            } else {
+                conditions.join(" & ")
+            };
+            let chain = if rule.providers.is_empty() {
+                "(no providers)".to_string()
+            } else {
+                rule.providers.join(" → ")
+            };
+            ListItem::new(format!(
+                "  {}  [{}]  {}",
+                name, match_str, chain
+            ))
         })
         .collect();
 
@@ -981,7 +1086,7 @@ pub(super) fn render_failover_editor(frame: &mut Frame<'_>, app: &App, area: Rec
         .highlight_symbol(highlight_symbol(theme));
 
     let mut state = ListState::default();
-    state.select(Some(app.failover_idx));
+    state.select(Some(editor.idx));
     frame.render_stateful_widget(list, chunks[1], &mut state);
 }
 
