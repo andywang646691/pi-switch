@@ -75,7 +75,6 @@ fn render_help(frame: &mut Frame<'_>, app: &App) {
         Line::default(),
         section(i18n::help_section_profiles()),
         item("Enter", i18n::help_profiles_enter()),
-        item("Space / s", i18n::help_profiles_space()),
         item("a", i18n::help_profiles_a()),
         item("e", i18n::help_profiles_e()),
         item("c", i18n::help_profiles_c()),

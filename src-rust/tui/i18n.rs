@@ -206,9 +206,6 @@ pub fn home_profiles() -> &'static str {
 pub fn home_current() -> &'static str {
     t!("Current", "当前")
 }
-pub fn home_write_mode() -> &'static str {
-    t!("Write mode", "写入模式")
-}
 pub fn home_proxy_daemon() -> &'static str {
     t!("Proxy daemon", "代理守护进程")
 }
@@ -462,9 +459,6 @@ pub fn form_api_cycle_hint() -> &'static str {
 pub fn key_detail() -> &'static str {
     t!("detail", "详情")
 }
-pub fn key_switch() -> &'static str {
-    t!("switch", "切换")
-}
 pub fn key_add() -> &'static str {
     t!("add", "添加")
 }
@@ -580,12 +574,6 @@ pub fn help_profiles_enter() -> &'static str {
     t!(
         "    Enter           open profile detail",
         "    Enter           打开供应商详情"
-    )
-}
-pub fn help_profiles_space() -> &'static str {
-    t!(
-        "    Space / s       switch pi to this profile",
-        "    Space / s       切换 pi 到此供应商"
     )
 }
 pub fn help_profiles_a() -> &'static str {
@@ -732,13 +720,6 @@ pub fn confirm_discard_msg() -> &'static str {
 
 pub fn toast_refreshed() -> &'static str {
     t!("Refreshed", "已刷新")
-}
-pub fn toast_switched(name: &str, id: &str) -> String {
-    if is_zh() {
-        format!("已切换到 '{name}' ({id})")
-    } else {
-        format!("Switched to '{name}' ({id})")
-    }
 }
 pub fn toast_status_refreshed() -> &'static str {
     t!("Status refreshed", "状态已刷新")

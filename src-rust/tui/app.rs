@@ -630,11 +630,6 @@ impl App {
                     self.route = Route::ProfileDetail(name);
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Char('s') => {
-                if let Some(name) = self.selected_profile_name() {
-                    self.switch_profile(&name);
-                }
-            }
             KeyCode::Char('a') => self.open_add_form(),
             KeyCode::Char('e') => {
                 if let Some(name) = self.selected_profile_name() {
@@ -672,7 +667,6 @@ impl App {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
             }
             KeyCode::Char('e') => self.open_edit_form(name),
-            KeyCode::Char(' ') | KeyCode::Char('s') => self.switch_profile(name),
             KeyCode::Char('d') => self.confirm_delete(name),
             KeyCode::Char('x') => {
                 // Expose models selection
@@ -1237,19 +1231,6 @@ impl App {
     }
 
     // ─── Profile actions ──────────────────────────────────
-
-    fn switch_profile(&mut self, name: &str) {
-        match ops::use_profile(name, None) {
-            Ok(outcome) => {
-                self.push_toast(
-                    ToastKind::Success,
-                    i18n::toast_switched(&outcome.name, &outcome.provider_id),
-                );
-                self.refresh();
-            }
-            Err(e) => self.push_toast(ToastKind::Error, e.to_string()),
-        }
-    }
 
     fn copy_profile(&mut self, src: &str) {
         let mut dst = format!("{src}-copy");

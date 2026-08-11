@@ -68,11 +68,6 @@ pub(super) fn render_home(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .clone()
                 .unwrap_or_else(|| "none".into()),
         ),
-        label_line(
-            app,
-            i18n::home_write_mode(),
-            app.data.config.settings.write_mode.clone(),
-        ),
         label_line(app, i18n::home_proxy_daemon(), daemon),
         Line::default(),
         label_line(
@@ -724,14 +719,6 @@ pub(super) fn render_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         &[
             ("↑↓", i18n::key_move()),
-            (
-                "←→/Space",
-                if app.settings_proxy_idx == 0 || app.settings_proxy_idx == 3 {
-                    i18n::key_switch()
-                } else {
-                    ""
-                },
-            ),
             (
                 "Enter",
                 if app.settings_proxy_idx == 4 {

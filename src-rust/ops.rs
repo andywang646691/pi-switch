@@ -1,6 +1,4 @@
-use crate::config::{
-    self, backup_config, load_config, provider_id_for, save_config, ProviderProfile,
-};
+use crate::config::{self, backup_config, load_config, save_config, ProviderProfile};
 use crate::error::{AppError, Result};
 use std::path::PathBuf;
 
@@ -67,13 +65,6 @@ pub fn set_failover(failover_profiles: Vec<String>) -> Result<Option<PathBuf>> {
     config.settings.proxy.failover = failover_profiles;
     save_config(&config)?;
     Ok(backup)
-}
-
-pub struct UseOutcome {
-    pub name: String,
-    pub provider_id: String,
-    pub models_backup: Option<PathBuf>,
-    pub config_backup: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -211,61 +202,6 @@ pub fn update_provider_models(
 
     Ok(backup)
 }
-fn backup_models() -> Option<PathBuf> {
-    let models_path = config::models_path();
-    if !models_path.exists() {
-        return None;
-    }
-    let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S-%3fZ");
-    let backup_path = config::backup_dir().join(format!("models-{}.json", ts));
-    std::fs::create_dir_all(config::backup_dir()).ok();
-    std::fs::copy(&models_path, &backup_path).ok()?;
-    Some(backup_path)
-}
-
-pub fn use_profile(name: &str, mode: Option<&str>) -> Result<UseOutcome> {
-    let mut config = load_config()?;
-
-    let mode = mode
-        .map(str::to_string)
-        .unwrap_or_else(|| config.settings.write_mode.clone());
-    let provider_id = provider_id_for(&config, name);
-
-    let models_path = config::models_path();
-    let models_backup = backup_models();
-
-    // Handle exclusive mode
-    if mode == "exclusive" {
-        let mut models: serde_json::Value = if models_path.exists() {
-            let text = std::fs::read_to_string(&models_path).unwrap_or_default();
-            serde_json::from_str(&text).unwrap_or(serde_json::json!({ "providers": {} }))
-        } else {
-            serde_json::json!({ "providers": {} })
-        };
-
-        if let Some(providers) = models["providers"].as_object_mut() {
-            let prefix = format!("{}-", config.settings.provider_prefix);
-            providers.retain(|k, _| !k.starts_with(&prefix));
-            write_models_atomic(&models)?;
-        }
-    }
-
-    // Sync the gateway provider to pi config
-    sync_gateway_to_pi()?;
-
-    let config_backup = backup_config("config")?;
-
-    config.current = Some(name.to_string());
-    save_config(&config)?;
-
-    Ok(UseOutcome {
-        name: name.to_string(),
-        provider_id,
-        models_backup,
-        config_backup,
-    })
-}
-
 pub fn upsert_profile(
     name: &str,
     profile: &ProviderProfile,

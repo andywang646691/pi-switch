@@ -96,8 +96,6 @@ export const api = {
   deleteProfile: (name: string) => req("DELETE", `/profiles/${enc(name)}`),
   duplicateProfile: (name: string, asName: string) =>
     req("POST", `/profiles/${enc(name)}/duplicate`, { as: asName }),
-  useProfile: (name: string, mode?: string) =>
-    req("POST", `/profiles/${enc(name)}/use`, mode ? { mode } : {}),
   testProfile: (name: string) =>
     req<TestResult>("POST", `/profiles/${enc(name)}/test`),
   fetchModels: (name: string) =>

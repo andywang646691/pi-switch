@@ -71,14 +71,12 @@ export function ProfilesPanel({
           </Card>
         )}
         {entries.map(([name, p]) => {
-          const isCurrent = state.current === name;
           const exposed = p.exposedModels?.length ?? 0;
           return (
             <Card key={name} className="flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="truncate font-medium text-zinc-100">{name}</span>
-                  {isCurrent && <Badge tone="indigo">{t("current")}</Badge>}
                   {p.proxy && <Badge tone="amber">{t("proxy")}</Badge>}
                   <Badge>{p.api || "?"}</Badge>
                   <Badge tone="indigo">{t("Responses")}: {effectiveResponsesMode(p)}</Badge>
@@ -97,15 +95,6 @@ export function ProfilesPanel({
                 </div>
               </div>
               <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-                {!isCurrent && (
-                  <Button
-                    onClick={() =>
-                      run(() => api.useProfile(name), `${t("Switched to")} ${name}`, refresh)
-                    }
-                  >
-                    {t("Use")}
-                  </Button>
-                )}
                 <Button onClick={() => setModels(name)}>{t("Models")}</Button>
                 <Button onClick={() => setEditing({ name })}>{t("Edit")}</Button>
                 <Button

@@ -11,7 +11,6 @@ export const {
   addProvider,
   listProfiles,
   showProfile,
-  useProfile,
   removeProfile,
   listBackups,
   doctor,

@@ -102,7 +102,6 @@ pub fn make_web_router(state: Arc<WebState>) -> Router {
         .route("/init", post(post_init))
         .route("/profiles", post(post_profile))
         .route("/profiles/:name/duplicate", post(post_duplicate))
-        .route("/profiles/:name/use", post(post_use))
         .route("/profiles/:name/test", post(post_test))
         .route("/profiles/:name/fetch-models", post(post_fetch_models))
         .route("/profiles/:name/models", put(put_models))
@@ -432,22 +431,6 @@ struct DuplicateBody {
 async fn post_duplicate(Path(name): Path<String>, Json(body): Json<DuplicateBody>) -> ApiJson {
     let backup = ops::duplicate_profile(&name, &body.as_name)?;
     ok(backup_msg(backup))
-}
-
-#[derive(Deserialize)]
-struct UseBody {
-    mode: Option<String>,
-}
-
-async fn post_use(Path(name): Path<String>, Json(body): Json<UseBody>) -> ApiJson {
-    let outcome = ops::use_profile(&name, body.mode.as_deref())?;
-    ok(json!({
-        "ok": true,
-        "name": outcome.name,
-        "providerId": outcome.provider_id,
-        "modelsBackup": outcome.models_backup.map(|p| p.display().to_string()),
-        "configBackup": outcome.config_backup.map(|p| p.display().to_string()),
-    }))
 }
 
 async fn post_test(Path(name): Path<String>) -> ApiJson {

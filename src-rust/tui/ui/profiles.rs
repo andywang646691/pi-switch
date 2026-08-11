@@ -49,7 +49,6 @@ pub(super) fn render_profiles(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let fltr = i18n::key_filter();
     let empty_keys: &[(&str, &str)] = &[("a", add), ("/", fltr)];
     let detail = i18n::key_detail();
-    let switch = i18n::key_switch();
     let copy = i18n::key_copy();
     let edit = i18n::key_edit();
     let del = i18n::key_delete();
@@ -60,7 +59,6 @@ pub(super) fn render_profiles(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let full_keys: &[(&str, &str)] = &[
         ("Enter", detail),
-        ("Space", switch),
         ("a", add),
         ("c", copy),
         ("e", edit),
@@ -278,7 +276,6 @@ pub(super) fn render_profile_detail(frame: &mut Frame<'_>, app: &App, area: Rect
         chunks[0],
         &[
             ("e", i18n::key_edit()),
-            ("Space", i18n::key_switch()),
             ("d", i18n::key_delete()),
             ("x", i18n::key_expose()),
             ("u", if i18n::is_zh() { "用户代理" } else { "UA" }),

@@ -40,12 +40,6 @@ export function SettingsPanel({
               onChange={(e) => set({ providerPrefix: e.target.value })}
             />
           </Field>
-          <Field label={t("Write mode")}>
-            <Select value={s.writeMode} onChange={(e) => set({ writeMode: e.target.value })}>
-              <option value="merge">merge</option>
-              <option value="exclusive">exclusive</option>
-            </Select>
-          </Field>
           <Field label={t("Language")}>
             <Select
               value={s.language ?? ""}

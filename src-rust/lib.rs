@@ -211,27 +211,6 @@ pub fn show_profile(name: String) -> napi::Result<String> {
 }
 
 #[napi(object)]
-pub struct UseResult {
-    pub name: String,
-    pub provider_id: String,
-    pub models_backup: Option<String>,
-    pub config_backup: Option<String>,
-}
-
-#[napi]
-pub fn use_profile(name: String, mode: Option<String>) -> napi::Result<UseResult> {
-    let outcome = ops::use_profile(&name, mode.as_deref())
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-
-    Ok(UseResult {
-        name: outcome.name,
-        provider_id: outcome.provider_id,
-        models_backup: outcome.models_backup.map(|p| p.display().to_string()),
-        config_backup: outcome.config_backup.map(|p| p.display().to_string()),
-    })
-}
-
-#[napi(object)]
 pub struct RemoveResult {
     pub name: String,
     pub backup: Option<String>,
