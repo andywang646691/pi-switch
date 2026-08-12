@@ -236,6 +236,7 @@ Requests are routed by the model name in the request body — no out-of-band sta
 - **Single gateway provider** — pi sees one `pi-switch` provider advertising every exposed model as `profile/realModelId`; switching model in pi = sending a different model string = instant routing change
 - **Rule-based failover** — the first rule whose match conditions hit the requested model decides the provider chain, tried in order on 429/5xx errors or network failures (provider-level granularity; providers may map the model via `modelMap`)
 - **Circuit breaker** — after 3 consecutive failures, provider enters 60s cooldown; auto-recovery on half-open probe success
+- **Recovery monitor** — when every upstream of a chain is circuit-open, the proxy kernel periodically probes the broken nodes per `settings.proxy.monitor`; a recovered node exits circuit-break and appends one line to `recovery.jsonl`, which the pi extension watches to auto-send a `continue` so pi retries
 - **Streaming (SSE)** — same-format requests (openai→openai, anthropic→anthropic) stream token-by-token; upstream response headers (Content-Type, etc.) are preserved
 - **OpenAI ↔ Anthropic** — transparently converts between chat completions and messages APIs
 - **User-Agent disguise** — built-in presets (Claude Code / Codex / Gemini) send the matching client's real User-Agent (and headers like `anthropic-beta`) to pass upstream client checks; settable globally or per-profile
@@ -257,6 +258,7 @@ pi-switch/
 │   ├── ops.rs               # Core operations
 │   ├── presets.rs           # Built-in provider presets
 │   ├── proxy.rs             # Proxy server (gateway routing, failover, circuit breaker)
+│   ├── monitor.rs           # Upstream recovery monitor (probe broken chains, emit recovery events)
 │   ├── daemon.rs            # Daemon lifecycle
 │   ├── stats.rs             # Request log aggregation + token usage stats
 │   ├── usage.rs             # Token usage extraction & SSE stream parsing
@@ -268,6 +270,7 @@ pi-switch/
 │       └── ui/              # Rendering (chrome, pages, overlays)
 ├── src/                     # JavaScript layer (pi extension support)
 ├── extensions/index.ts      # Pi agent extension (/piswitch)
+├── extensions/failover-watchdog.ts  # Pi agent extension (recovery event → "continue" bridge)
 └── Cargo.toml
 ```
 
@@ -276,6 +279,7 @@ pi-switch/
 - `~/.pi-switch/requests.log` — per-request JSON log (status, latency, token usage, conversation id)
 - `~/.pi-switch/backups/` — timestamped auto-backups on every mutation
 - `~/.pi/agent/models.json` — pi's provider registry (pi-switch writes a single gateway provider)
+- `~/.pi-switch/recovery.jsonl` — recovery events emitted by the monitor (watched by the pi extension)
 
 ---
 

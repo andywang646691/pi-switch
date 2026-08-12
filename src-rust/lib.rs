@@ -4,6 +4,7 @@ mod daemon;
 mod database;
 mod error;
 mod models;
+mod monitor;
 mod ops;
 mod package;
 mod package_ops;
@@ -277,6 +278,12 @@ pub async fn run_proxy_server(host: String, port: u16) -> napi::Result<()> {
     // Config is loaded per request inside the handlers, so the running proxy always
     // reflects the latest target/failover without needing a restart.
     let state = Arc::new(proxy::ProxyState {});
+
+    // Upstream recovery monitor: watches for fully-broken failover chains,
+    // probes broken nodes and appends recovery events for the pi extension.
+    tokio::spawn(async {
+        monitor::run_monitor_loop().await;
+    });
 
     let app = proxy::make_router(state);
     let addr = format!("{}:{}", host, port);

@@ -1,6 +1,6 @@
 {
   "name": "@andywangzzm/pi-switch",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Lightweight profile switcher for pi models.json",
   "type": "module",
   "bin": {
@@ -29,7 +29,8 @@
     "pi-switch-native.linux-x64-musl.node",
     "pi-switch-native.win32-x64-msvc.node",
     "extensions/index.ts",
-    "extensions/conversation-id-inject.ts"
+    "extensions/conversation-id-inject.ts",
+    "extensions/failover-watchdog.ts"
   ],
   "scripts": {
     "artifacts": "napi artifacts",
@@ -50,7 +51,8 @@
   "pi": {
     "extensions": [
       "./extensions/index.ts",
-      "./extensions/conversation-id-inject.ts"
+      "./extensions/conversation-id-inject.ts",
+      "./extensions/failover-watchdog.ts"
     ]
   },
   "license": "MIT",

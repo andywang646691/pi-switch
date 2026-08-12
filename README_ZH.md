@@ -235,6 +235,7 @@ pi-switch proxy start --daemon
 - **单个网关 provider** — pi 只看到一个 `pi-switch` provider，下面列出所有暴露模型（格式 `profile/真实模型ID`）；在 pi 中切换模型 = 发送不同的 model 字符串 = 即时路由切换
 - **规则故障转移** — 第一条匹配请求模型的规则决定 provider 链，429/5xx 或网络错误时按顺序尝试（provider 级粒度；provider 可通过 `modelMap` 映射模型）
 - **断路器保护** — 连续 3 次失败后进入 60s 冷却，半开探测成功后自动恢复
+- **上游恢复监测** — 链路所有上游都熔断时，代理内核按 `settings.proxy.monitor` 配置定期探测熔断节点；节点恢复即退出熔断并追加一行到 `recovery.jsonl`，pi 扩展监听到后自动发一条 `continue` 让 pi 重试
 - **流式（SSE）** — 同格式请求（openai→openai、anthropic→anthropic）逐字流式转发；保留上游响应头（Content-Type 等）
 - **OpenAI ↔ Anthropic** — 自动在 chat completions 和 messages API 间转换
 - **User-Agent 伪装** — 内置 Claude Code / Codex / Gemini 预设，发送对应客户端的真实 User-Agent（及 `anthropic-beta` 等头）以通过上游客户端校验；支持全局或按 profile 设置
@@ -256,6 +257,7 @@ pi-switch/
 │   ├── ops.rs               # 核心操作
 │   ├── presets.rs           # 内置 provider 预设
 │   ├── proxy.rs             # 代理服务器（网关路由、故障转移、断路器）
+│   ├── monitor.rs           # 上游恢复监测（探测熔断链路节点、写恢复事件）
 │   ├── daemon.rs            # 守护进程管理
 │   ├── stats.rs             # 请求日志聚合 + token 统计
 │   ├── usage.rs             # Token 使用量提取 & SSE 流解析
@@ -267,6 +269,7 @@ pi-switch/
 │       └── ui/              # 渲染（chrome, pages, overlays）
 ├── src/                     # JavaScript 层（pi 扩展支持）
 ├── extensions/index.ts      # Pi agent 扩展（/piswitch）
+├── extensions/failover-watchdog.ts  # Pi agent 扩展（恢复事件 → continue 桥接）
 └── Cargo.toml
 ```
 
@@ -275,6 +278,7 @@ pi-switch/
 - `~/.pi-switch/requests.log` — 每次请求的 JSON 日志（状态、延迟、token 使用量、对话标识）
 - `~/.pi-switch/backups/` — 每次修改自动生成带时间戳的备份
 - `~/.pi/agent/models.json` — pi 的 provider 注册表（pi-switch 写入单个网关 provider）
+- `~/.pi-switch/recovery.jsonl` — 监测器写入的恢复事件（pi 扩展监听）
 
 ---
 

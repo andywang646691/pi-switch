@@ -246,6 +246,16 @@ pub async fn write_circuit_state(state: &CircuitStateStore) {
     }
 }
 
+/// Whether a provider is in a broken state (`opened_at` set — covers both the
+/// cooldown window and the half-open probing window).
+pub(crate) fn is_node_broken(name: &str, state: &CircuitStateStore) -> bool {
+    state
+        .providers
+        .get(name)
+        .map(|e| e.opened_at.is_some())
+        .unwrap_or(false)
+}
+
 fn is_circuit_open(
     state: &CircuitStateStore,
     name: &str,
@@ -300,6 +310,23 @@ async fn record_success(name: &str, half_open: bool) {
     }
 
     write_circuit_state(&state).await;
+}
+
+/// Exit circuit-break for a single provider (used by the recovery monitor):
+/// reset the failure count and clear the opened timestamp unconditionally,
+/// stamp a success. Returns true when the entry was open (a real recovery
+/// transition happened), false otherwise.
+pub(crate) async fn clear_circuit(name: &str) -> bool {
+    let mut state = read_circuit_state().await;
+    let Some(entry) = state.providers.get_mut(name) else {
+        return false;
+    };
+    let was_open = entry.opened_at.is_some();
+    entry.failures = 0;
+    entry.opened_at = None;
+    entry.last_success_at = Some(now_ms());
+    write_circuit_state(&state).await;
+    was_open
 }
 
 async fn record_failure(

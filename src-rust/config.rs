@@ -164,6 +164,38 @@ pub struct CircuitBreakerSettings {
     pub cooldown_seconds: u32,
 }
 
+/// Upstream recovery monitor (runs inside the proxy process).
+///
+/// When every node of a failover chain is circuit-open, the monitor enters
+/// watch mode, periodically probes the broken nodes, and clears a node's
+/// circuit the moment it answers healthily — then appends a recovery event to
+/// `~/.pi-switch/recovery.jsonl` so the pi extension can send a "continue".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_probe_interval_seconds")]
+    #[serde(rename = "probeIntervalSeconds")]
+    pub probe_interval_seconds: u64,
+    #[serde(default = "default_probe_timeout_ms")]
+    #[serde(rename = "probeTimeoutMs")]
+    pub probe_timeout_ms: u64,
+    #[serde(default = "default_probe_path")]
+    #[serde(rename = "probePath")]
+    pub probe_path: String,
+}
+
+impl Default for MonitorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            probe_interval_seconds: default_probe_interval_seconds(),
+            probe_timeout_ms: default_probe_timeout_ms(),
+            probe_path: default_probe_path(),
+        }
+    }
+}
+
 /// Rule-match conditions. All provided fields must match the requested model id
 /// (the part after the leading `profile/` namespace, e.g. `deepseek-v4-pro` for
 /// `ds/deepseek-v4-pro`). At least one condition must be set for the rule to be
@@ -241,10 +273,17 @@ pub struct ProxySettings {
     /// the legacy single global `failover` chain.
     #[serde(default)]
     pub rules: Vec<FailoverRule>,
+    /// Legacy single global failover chain (still written by the JS layer's
+    /// `setProxyTarget`; the native proxy routes by rules + namespacing, but the
+    /// recovery monitor treats it as one chain so legacy configs keep working).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "userAgent")]
     pub user_agent: Option<String>,
     #[serde(default, rename = "circuitBreaker")]
     pub circuit_breaker: CircuitBreakerSettings,
+    #[serde(default, rename = "monitor")]
+    pub monitor: MonitorSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +341,15 @@ fn default_failure_threshold() -> u32 {
 fn default_cooldown() -> u32 {
     60
 }
+fn default_probe_interval_seconds() -> u64 {
+    15
+}
+fn default_probe_timeout_ms() -> u64 {
+    8000
+}
+fn default_probe_path() -> String {
+    "/models".into()
+}
 fn default_host() -> String {
     "127.0.0.1".into()
 }
@@ -345,12 +393,14 @@ impl Default for PiSwitchConfig {
                     port: default_port(),
                     target: None,
                     rules: vec![],
+                    failover: vec![],
                     user_agent: None,
                     circuit_breaker: CircuitBreakerSettings {
                         enabled: true,
                         failure_threshold: 3,
                         cooldown_seconds: 60,
                     },
+                    monitor: MonitorSettings::default(),
                 },
                 web: WebSettings {
                     host: default_web_host(),
