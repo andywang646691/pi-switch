@@ -48,18 +48,70 @@ export function ProfilesPanel({
   const [ccImport, setCcImport] = useState(false);
   const [testing, setTesting] = useState<Record<string, boolean>>({});
   const [testResults, setTestResults] = useState<Record<string, { success: boolean; message: string; responseTimeMs?: number }>>({});
+  const [testingAll, setTestingAll] = useState(false);
+  const [allSummary, setAllSummary] = useState<{ ok: number; total: number } | null>(null);
 
   const entries = Object.entries(state.profiles).sort(([a], [b]) => a.localeCompare(b));
+  // proxy profiles are meta (point at the local gateway), not upstreams — skip them
+  const testable = entries.filter(([, p]) => !p.proxy);
+
+  async function testAll() {
+    const names = testable.map(([n]) => n);
+    setTestingAll(true);
+    setAllSummary(null);
+    setTestResults((current) => {
+      const next = { ...current };
+      for (const n of names) delete next[n];
+      return next;
+    });
+    const results = await Promise.all(
+      names.map(async (name) => {
+        try {
+          const r = await api.testProfile(name);
+          setTestResults((current) => ({ ...current, [name]: r }));
+          return r;
+        } catch (e) {
+          const r = { success: false, message: e instanceof Error ? e.message : String(e) };
+          setTestResults((current) => ({ ...current, [name]: r }));
+          return r;
+        }
+      }),
+    );
+    setAllSummary({ ok: results.filter((r) => r.success).length, total: results.length });
+    setTestingAll(false);
+  }
+
 
   return (
     <div>
       <SectionTitle hint={`${entries.length} ${t("profile(s)")}`}>{t("Profiles")}</SectionTitle>
 
-      <div className="mb-3 flex gap-2">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
         <Button variant="primary" onClick={() => setEditing({ name: null })}>
           {t("+ Add profile")}
         </Button>
         <Button onClick={() => setCcImport(true)}>⇥ {t("Import from cc-switch")}</Button>
+        <Button
+          onClick={() => void testAll()}
+          disabled={testingAll || testable.length === 0}
+          title={testable.length === entries.length ? undefined : t("Proxy profiles are skipped")}
+        >
+          {testingAll ? (
+            <>
+              <span className="button-spinner" />
+              {t("Testing all…")}
+            </>
+          ) : (
+            t("Test all")
+          )}
+        </Button>
+        {allSummary && (
+          <span
+            className={`text-xs ${allSummary.ok === allSummary.total ? "text-emerald-300" : "text-red-300"}`}
+          >
+            {allSummary.ok}/{allSummary.total} {t("reachable")}
+          </span>
+        )}
       </div>
 
       <div className="space-y-2">

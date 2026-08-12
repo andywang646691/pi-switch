@@ -80,3 +80,86 @@ describe("provider Responses mode form", () => {
     expect(screen.getByText("Responses: convert")).toBeInTheDocument();
   });
 });
+
+describe("test all providers", () => {
+  function stateWithProfiles(profiles: Record<string, unknown>) {
+    return {
+      current: "native",
+      profiles,
+      settings: {},
+    } as unknown as AppState;
+  }
+
+  beforeEach(() => {
+    vi.spyOn(api, "getPresets").mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("runs one test per non-proxy profile and shows a summary", async () => {
+    const test = vi
+      .spyOn(api, "testProfile")
+      .mockImplementation(async (name: string) =>
+        name === "native"
+          ? { success: true, message: "✓ Connected successfully (HTTP 200)", responseTimeMs: 120 }
+          : { success: false, message: "✗ HTTP 500", responseTimeMs: 300 },
+      );
+    renderPanel(
+      stateWithProfiles({
+        native: {
+          api: "openai-completions",
+          baseUrl: "https://example.test/v1",
+          apiKey: "key",
+          models: [],
+          proxy: false,
+          responsesMode: "auto",
+        },
+        broken: {
+          api: "openai-completions",
+          baseUrl: "https://broken.test/v1",
+          apiKey: "key",
+          models: [],
+          proxy: false,
+          responsesMode: "auto",
+        },
+        gateway: {
+          api: "openai-completions",
+          baseUrl: "http://127.0.0.1:43112/v1",
+          apiKey: "pi-switch-proxy",
+          models: [],
+          proxy: true,
+          responsesMode: "auto",
+        },
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Test all" }));
+
+    await waitFor(() => expect(test).toHaveBeenCalledTimes(2)); // proxy profile skipped
+    expect(test).toHaveBeenCalledWith("native");
+    expect(test).toHaveBeenCalledWith("broken");
+    await waitFor(() => expect(screen.getByText("1/2 reachable")).toBeInTheDocument());
+    expect(screen.getAllByText("Reachable")).toHaveLength(1); // success shows label + latency, not the raw message
+    expect(screen.getByText("120ms")).toBeInTheDocument();
+    expect(screen.getByText("✗ HTTP 500")).toBeInTheDocument(); // failure shows the raw message
+  });
+
+  it("disables the button when there is nothing testable", () => {
+    renderPanel(
+      stateWithProfiles({
+        gateway: {
+          api: "openai-completions",
+          baseUrl: "http://127.0.0.1:43112/v1",
+          apiKey: "pi-switch-proxy",
+          models: [],
+          proxy: true,
+          responsesMode: "auto",
+        },
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Test all" })).toBeDisabled();
+  });
+});
