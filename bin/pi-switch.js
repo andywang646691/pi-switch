@@ -23,6 +23,10 @@ import {
 import * as readline from "readline";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const pkg = require("../package.json");
 
 // Project root: parent of bin/ — used to locate bin/pi-switch.js when spawning daemon
 const PROJECT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -38,7 +42,7 @@ if (processCommand === "proxy" && processAction === "start") {
 }
 
 function usage() {
-  console.log(`pi-switch v0.5.2 — lightweight profile switcher for pi agent
+  console.log(`pi-switch v${pkg.version} — lightweight profile switcher for pi agent
 
 Usage:
   pi-switch provider list
