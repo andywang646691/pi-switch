@@ -23,20 +23,15 @@ pub struct RuleDraft {
     pub providers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RulesEditMode {
     /// Browsing the rule list
+    #[default]
     List,
     /// Editing the rule name / match prefix / match contains text field
     Text,
     /// Editing the provider chain (checkbox + sortable list)
     Providers,
-}
-
-impl Default for RulesEditMode {
-    fn default() -> Self {
-        RulesEditMode::List
-    }
 }
 
 /// Which text field is being edited when `RulesEditMode::Text`.

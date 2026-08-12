@@ -998,11 +998,7 @@ pub(super) fn render_rules_editor(frame: &mut Frame<'_>, app: &App, area: Rect) 
         let key_hints: &[(&str, &str)] = &[("Enter", i18n::key_save()), ("Esc", i18n::key_back())];
         render_key_bar_center(frame, theme, chunks[0], key_hints);
 
-        let prompt = if i18n::is_zh() {
-            format!("{}: ", field_label)
-        } else {
-            format!("{}: ", field_label)
-        };
+        let prompt = format!("{}: ", field_label);
         let text = format!("{}{}", prompt, editor.input.value);
         let (visible, _) = crate::tui::text_edit::visible_text_window(
             &text,
