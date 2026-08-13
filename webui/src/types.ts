@@ -75,6 +75,7 @@ export interface ProxySettings {
   rules: FailoverRule[];
   userAgent?: string;
   circuitBreaker: CircuitBreakerSettings;
+  rawLog?: RawLogSettings;
 }
 
 export interface WebSettings {
@@ -263,4 +264,48 @@ export interface CcsImportResult {
   name: string;
   imported: boolean;
   message: string;
+}
+
+// ─── Raw request/response log (Web UI only) ───────────────
+
+export interface RawLogHeaderBlock {
+  ts: string;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body?: string;
+  bodyTruncated?: boolean;
+  bodyBytes?: number;
+}
+
+export interface RawLogAttempt {
+  provider: string;
+  url: string;
+  status?: number | null;
+  ok: boolean;
+  headers: Record<string, string>;
+  body?: string;
+  bodyTruncated?: boolean;
+  bodyBytes?: number;
+  error?: string | null;
+}
+
+export interface RawLogEntry {
+  id: string;
+  requestId: string;
+  ts: string;
+  ok: boolean;
+  error?: string | null;
+  client: RawLogHeaderBlock;
+  attempt: RawLogAttempt | null;
+}
+
+export interface RawLogsPage {
+  total: number;
+  entries: RawLogEntry[];
+}
+
+export interface RawLogSettings {
+  enabled: boolean;
+  maxBodyBytes?: number;
 }

@@ -90,6 +90,9 @@ pub fn make_web_router(state: Arc<WebState>) -> Router {
         .route("/proxy/status", get(get_proxy_status))
         .route("/webui/info", get(get_webui_info))
         .route("/logs/export", get(get_logs_export))
+        // raw request/response capture (Web UI only)
+        .route("/rawlogs", get(get_rawlogs).delete(clear_rawlogs))
+        .route("/rawlogs/:id", get(get_rawlog))
         // package management
         .route("/packages", get(get_packages).post(post_package))
         .route("/packages/import", post(post_package_import))
@@ -281,6 +284,38 @@ async fn get_logs_export(Query(q): Query<HashMap<String, String>>) -> Response {
         body,
     )
         .into_response()
+}
+
+// ─── Raw request/response log handlers (Web UI only) ──────
+
+/// List raw-log entries newest-first (metadata only — bodies are fetched per
+/// entry via `get_rawlog` so list responses stay small even with huge bodies).
+async fn get_rawlogs(Query(q): Query<HashMap<String, String>>) -> ApiJson {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let entries = crate::rawlog::list(limit, offset);
+    Ok(Json(json!({ "total": crate::rawlog::count(), "entries": entries })))
+}
+
+/// One full raw-log entry (with raw bodies) by id.
+async fn get_rawlog(Path(id): Path<String>) -> ApiJson {
+    match crate::rawlog::get(&id) {
+        Some(entry) => Ok(Json(entry)),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("raw log entry {id} not found"),
+        )),
+    }
+}
+
+/// Delete all captured raw entries.
+async fn clear_rawlogs() -> ApiJson {
+    let cleared = crate::rawlog::clear();
+    Ok(Json(json!({ "cleared": cleared })))
 }
 
 // ─── Package handlers ─────────────────────────────────────
@@ -782,5 +817,96 @@ mod tests {
         assert_eq!(list.status(), StatusCode::OK, "list route unaffected");
         let detail = get("/api/stats/conversations/conv-a/requests").await;
         assert_eq!(detail.status(), StatusCode::OK, "detail route resolves too");
+    }
+
+    #[tokio::test]
+    async fn rawlogs_list_detail_and_clear_roundtrip() {
+        // Serialize with the other raw-log tests (shared state dir file).
+        let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The raw log lives in the test-isolated state dir (shared with proxy
+        // tests) — write a fixture entry through the module API, then exercise
+        // the HTTP routes.
+        let dir = crate::proxy::init_test_state_dir();
+        let _ = std::fs::remove_file(dir.join(crate::rawlog::RAW_LOG_FILE));
+        let uri: axum::http::Uri = "/v1/chat/completions".parse().unwrap();
+        let client = crate::rawlog::RawClientCapture::capture(
+            &uri,
+            &axum::http::HeaderMap::new(),
+            "{\"model\":\"m\"}",
+        );
+        if let Some(client) = client {
+            crate::rawlog::append_raw_entry(&crate::rawlog::attempt_entry(
+                &client,
+                crate::rawlog::RawAttempt {
+                    provider: "p1".to_string(),
+                    url: "https://upstream/v1/chat/completions".to_string(),
+                    status: Some(200),
+                    ok: true,
+                    headers: vec![],
+                    body: "{\"id\":\"r1\"}".to_string(),
+                    body_truncated: false,
+                    error: None,
+                },
+            ));
+        } else {
+            // Capture disabled by the real config: seed the file directly so the
+            // route wiring is still exercised.
+            crate::rawlog::append_raw_entry(&serde_json::json!({
+                "id": "seed-1",
+                "requestId": "req-seed",
+                "ts": "2025-01-01T00:00:00Z",
+                "ok": true,
+                "client": { "ts": "2025-01-01T00:00:00Z", "method": "POST", "path": "/v1/chat/completions", "headers": {}, "body": "{}", "bodyTruncated": false, "bodyBytes": 2 },
+                "attempt": { "provider": "p1", "url": "https://upstream", "status": 200, "ok": true, "headers": {}, "body": "{}", "bodyTruncated": false, "bodyBytes": 2, "error": null }
+            }));
+        }
+
+        let list = get("/api/rawlogs?limit=10").await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list_body["total"], 1);
+        let entries = list_body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]["client"].get("body").is_none(),
+            "list strips bodies"
+        );
+        assert!(entries[0]["client"]["bodyBytes"].is_number());
+        let id = entries[0]["id"].as_str().unwrap();
+
+        let detail = get(&format!("/api/rawlogs/{id}")).await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(detail.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert!(detail_body["client"]["body"].is_string(), "detail keeps bodies");
+        assert!(detail_body["attempt"]["body"].is_string());
+
+        let missing = get("/api/rawlogs/does-not-exist").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let cleared = router()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/rawlogs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let after = get("/api/rawlogs").await;
+        let after_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(after.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after_body["total"], 0);
     }
 }

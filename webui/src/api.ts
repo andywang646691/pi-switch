@@ -12,6 +12,8 @@ import type {
   ProfileDetail,
   ProviderProfile,
   FailoverRule,
+  RawLogEntry,
+  RawLogsPage,
   TestResult,
   UsageStats,
   ValidationIssue,
@@ -72,6 +74,12 @@ export const api = {
     ),
   proxyStatus: () => req<DaemonResult>("GET", "/proxy/status"),
   webuiInfo: () => req<{ authRequired: boolean }>("GET", "/webui/info"),
+
+  // raw request/response log (Web UI only)
+  rawLogs: (limit = 50, offset = 0) =>
+    req<RawLogsPage>("GET", `/rawlogs?limit=${limit}&offset=${offset}`),
+  rawLog: (id: string) => req<RawLogEntry>("GET", `/rawlogs/${enc(id)}`),
+  clearRawLogs: () => req<{ cleared: number }>("DELETE", "/rawlogs"),
 
   // package management
   getPackages: () => req<{ packages: PackageEntry[] }>("GET", "/packages"),

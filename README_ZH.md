@@ -169,6 +169,18 @@ pi-switch import ccswitch --path /路径/cc-switch.db   # 自定义数据库路�
 
 ---
 
+## 🔍 原始请求/响应日志（Web UI）
+
+除了元数据日志 `requests.log`，代理还会把**客户端原始请求**与**上游原始响应**逐条写入 `~/.pi-switch/raw-requests.log`（JSON Lines），用于字节级排查「请求发了什么、上游回了什么」。
+
+- **捕获内容**：客户端请求（方法、路径、头、原始 body）＋每个上游尝试（provider、URL、状态、上游响应头、原始响应 body，SSE 流也逐块原样累积）。failover 多次尝试共享同一 `requestId`，每次尝试各一条，便于对比各上游的返回。
+- **敏感信息**：`authorization` / `x-api-key` / `cookie` 等凭据头会被掩码（如 `Bearer ***`）；hop-by-hop 头（host、content-length 等）不记录。
+- **体量上限**：单个请求/响应 body 默认最多捕获 2 MiB（配置 `settings.proxy.rawLog.maxBodyBytes`），超出部分从头截断并标记 `bodyTruncated`，长流不会撑爆内存与磁盘。
+- **仅在 WebUI 查看**：TUI/CLI 不读取该文件；WebUI 的「请求日志」页支持自动刷新（5s/30s/5min）、按请求分组展开查看原始头与 body、清空全部。接口为 `GET /api/rawlogs`（列表，仅元数据）、`GET /api/rawlogs/:id`（单条完整含 body）、`DELETE /api/rawlogs`（清空）。
+- **开关**：默认开启；设置页「代理」卡片可关闭捕获（`settings.proxy.rawLog.enabled`）。
+
+---
+
 ## 🎯 核心流程
 
 ### 网关路由与故障转移

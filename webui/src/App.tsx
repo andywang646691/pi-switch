@@ -8,19 +8,21 @@ import { ProfilesPanel } from "./components/ProfilesPanel";
 import { ProxyPanel } from "./components/ProxyPanel";
 import { PackagesPanel } from "./components/PackagesPanel";
 import { StatsPanel } from "./components/StatsPanel";
+import { RawLogsPanel } from "./components/RawLogsPanel";
 import { BackupsPanel } from "./components/BackupsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { DoctorPanel } from "./components/DoctorPanel";
 
-type NavKey = "home" | "profiles" | "proxy" | "packages" | "stats" | "backups" | "settings" | "doctor";
+type NavKey = "home" | "profiles" | "proxy" | "packages" | "stats" | "rawlogs" | "backups" | "settings" | "doctor";
 
-type NavIconName = "home" | "profiles" | "proxy" | "packages" | "stats" | "backups" | "settings" | "doctor";
+type NavIconName = "home" | "profiles" | "proxy" | "packages" | "stats" | "rawlogs" | "backups" | "settings" | "doctor";
 const NAV: { key: NavKey; label: string; icon: NavIconName }[] = [
   { key: "home", label: "Home", icon: "home" },
   { key: "profiles", label: "Profiles", icon: "profiles" },
   { key: "proxy", label: "Proxy", icon: "proxy" },
   { key: "packages", label: "Packages", icon: "packages" },
   { key: "stats", label: "Stats", icon: "stats" },
+  { key: "rawlogs", label: "Raw Logs", icon: "rawlogs" },
   { key: "backups", label: "Backups", icon: "backups" },
   { key: "settings", label: "Settings", icon: "settings" },
   { key: "doctor", label: "Doctor", icon: "doctor" },
@@ -33,6 +35,7 @@ function NavIcon({ name }: { name: NavIconName }) {
     proxy: "M4 8h13M14 5l3 3-3 3M20 16H7m3-3-3 3 3 3",
     packages: "M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9ZM4 7.5l8 4.5 8-4.5M12 12v9",
     stats: "M5 19V9M12 19V5M19 19v-7",
+    rawlogs: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M9 13h6M9 17h6",
     backups: "M4 7h16M6 3h12v18H6zM9 11h6M9 15h6",
     settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4M3 12h2M19 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M12 3v2M12 19v2",
     doctor: "M12 3v18M3 12h18M7 7l10 10M17 7 7 17",
@@ -155,6 +158,7 @@ function Shell({ onConfigLang }: { onConfigLang: (lang: string | null) => void }
               {nav === "proxy" && <ProxyPanel state={state} refresh={refresh} />}
               {nav === "packages" && <PackagesPanel refresh={refresh} />}
               {nav === "stats" && <StatsPanel state={state} refresh={refresh} />}
+              {nav === "rawlogs" && <RawLogsPanel />}
               {nav === "backups" && <BackupsPanel state={state} refresh={refresh} />}
               {nav === "settings" && <SettingsPanel state={state} refresh={refresh} />}
               {nav === "doctor" && <DoctorPanel state={state} refresh={refresh} />}

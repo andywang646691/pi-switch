@@ -119,6 +119,23 @@ export function SettingsPanel({
             </Field>
           </div>
         </div>
+        <div className="mt-2 rounded-lg border border-white/10 p-3">
+          <label className="flex items-center gap-2 text-sm text-zinc-300">
+            <input
+              type="checkbox"
+              checked={s.proxy.rawLog?.enabled ?? true}
+              onChange={(e) =>
+                setProxy({
+                  rawLog: { enabled: e.target.checked, maxBodyBytes: s.proxy.rawLog?.maxBodyBytes },
+                })
+              }
+            />
+            {t("Capture raw request/response logs")}
+          </label>
+          <div className="mt-1 text-xs text-zinc-500">
+            {t("Stores raw client requests and upstream responses (capped) in raw-requests.log, viewable in the Web UI only.")}
+          </div>
+        </div>
       </Card>
 
       <Card className="mb-4">

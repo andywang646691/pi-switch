@@ -3,7 +3,7 @@ use crate::error::{AppError, Result};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -626,12 +626,16 @@ async fn handle_models(State(_state): State<Arc<ProxyState>>) -> impl IntoRespon
 
 async fn handle_chat_completions(
     State(_state): State<Arc<ProxyState>>,
+    uri: Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
     let config = crate::config::load_config().unwrap_or_default();
     let body_value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let body_value = filter_private_params(body_value);
+
+    // Raw request capture (Web UI raw logs); `None` when capture is disabled.
+    let raw_client = crate::rawlog::RawClientCapture::capture(&uri, &headers, &body);
 
     // Route purely by the model name in the body: "profile/realModel" → that profile
     // (+ same-model failover), and the real model id to send upstream.
@@ -642,6 +646,12 @@ async fn handle_chat_completions(
     let (candidates, real_model) = resolve_route(&config, requested_model);
 
     if candidates.is_empty() {
+        if let Some(client) = &raw_client {
+            crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                client,
+                &format!("No upstream exposes model '{requested_model}'"),
+            ));
+        }
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "error": {
@@ -665,28 +675,38 @@ async fn handle_chat_completions(
             &headers,
             conversation_id.as_deref(),
             true,
+            raw_client.clone(),
         ),
     )
     .await;
 
     match result {
         Ok(resp) => resp,
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": { "message": e.to_string(), "type": "failover_exhausted" } })),
-        )
-            .into_response(),
+        Err(e) => {
+            if let Some(client) = &raw_client {
+                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &e.to_string()));
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": { "message": e.to_string(), "type": "failover_exhausted" } })),
+            )
+                .into_response()
+        }
     }
 }
 
 async fn handle_messages(
     State(_state): State<Arc<ProxyState>>,
+    uri: Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
     let config = crate::config::load_config().unwrap_or_default();
     let body_value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let body_value = filter_private_params(body_value);
+
+    // Raw request capture (Web UI raw logs); `None` when capture is disabled.
+    let raw_client = crate::rawlog::RawClientCapture::capture(&uri, &headers, &body);
 
     let requested_model = body_value
         .get("model")
@@ -707,6 +727,12 @@ async fn handle_messages(
         .collect();
 
     if candidates.is_empty() {
+        if let Some(client) = &raw_client {
+            crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                client,
+                &format!("No Anthropic upstream available for requested model '{requested_model}'"),
+            ));
+        }
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({ "error": { "message": "No Anthropic upstream available for requested model" } })),
@@ -724,17 +750,23 @@ async fn handle_messages(
             &real_model,
             &headers,
             conversation_id.as_deref(),
+            raw_client.clone(),
         ),
     )
     .await;
 
     match result {
         Ok(resp) => resp,
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": { "message": e.to_string() } })),
-        )
-            .into_response(),
+        Err(e) => {
+            if let Some(client) = &raw_client {
+                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &e.to_string()));
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": { "message": e.to_string() } })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1421,6 +1453,10 @@ struct ResponsesStreamTransform<S> {
     /// Set when a chat frame cannot be converted; the stream is then closed
     /// with a structured `response.failed` event instead of a fake success.
     conversion_error: Option<String>,
+    /// Raw-log spec for this attempt; `Some` also arms raw-body accumulation.
+    raw: Option<RawLogSpec>,
+    /// Capped raw upstream SSE body accumulator.
+    raw_body: Option<RawBodyAccumulator>,
 }
 
 impl<S, E> futures_util::Stream for ResponsesStreamTransform<S>
@@ -1446,6 +1482,9 @@ where
             match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
                 std::task::Poll::Ready(Some(Ok(chunk))) => {
                     self.buffer.extend_from_slice(&chunk);
+                    if let Some(acc) = &mut self.raw_body {
+                        acc.push(&chunk);
+                    }
                     self.drain_frames();
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
@@ -1475,7 +1514,16 @@ where
 }
 
 impl<S> ResponsesStreamTransform<S> {
-    fn new(inner: S, converter: ChatSseToResponses, fields: StreamLogFields) -> Self {
+    fn new(
+        inner: S,
+        converter: ChatSseToResponses,
+        fields: StreamLogFields,
+        raw: Option<RawLogSpec>,
+    ) -> Self {
+        // Capture the cap once at request time; never re-read the config per chunk.
+        let raw_body = raw
+            .as_ref()
+            .map(|_| RawBodyAccumulator::new(crate::rawlog::max_body_bytes()));
         Self {
             inner,
             converter,
@@ -1485,6 +1533,8 @@ impl<S> ResponsesStreamTransform<S> {
             fields: Some(fields),
             finished: false,
             conversion_error: None,
+            raw,
+            raw_body,
         }
     }
 
@@ -1522,24 +1572,44 @@ impl<S> ResponsesStreamTransform<S> {
 
     fn flush_log(&mut self, error: Option<String>) {
         if let Some(fields) = self.fields.take() {
-            append_log_line(&stream_log_entry(fields, self.usage.as_ref(), error));
+            append_log_line(&stream_log_entry(fields, self.usage.as_ref(), error.clone()));
+        }
+        if let Some(spec) = self.raw.take() {
+            match self.raw_body.take().map(RawBodyAccumulator::finish) {
+                Some((body, truncated)) => spec.write_capped(&body, truncated, error.as_deref()),
+                None => spec.write_buffered(&[], error.as_deref()),
+            }
         }
     }
 }
 
 async fn handle_responses(
     State(_state): State<Arc<ProxyState>>,
+    uri: Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
     let config = crate::config::load_config().unwrap_or_default();
-    handle_responses_with_config(&config, headers, body).await
+    // Raw request capture (Web UI raw logs); `None` when capture is disabled.
+    let raw_client = crate::rawlog::RawClientCapture::capture(&uri, &headers, &body);
+    handle_responses_with_raw(&config, headers, body, raw_client).await
 }
 
+/// Test-friendly entry point without raw capture (kept for existing tests).
+#[cfg(test)]
 async fn handle_responses_with_config(
     config: &crate::config::PiSwitchConfig,
     headers: HeaderMap,
     body: String,
+) -> Response {
+    handle_responses_with_raw(config, headers, body, None).await
+}
+
+async fn handle_responses_with_raw(
+    config: &crate::config::PiSwitchConfig,
+    headers: HeaderMap,
+    body: String,
+    raw_client: Option<crate::rawlog::RawClientCapture>,
 ) -> Response {
     let body_value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let body_value = filter_private_params(body_value);
@@ -1558,6 +1628,12 @@ async fn handle_responses_with_config(
             .unwrap_or("");
         let (candidates, real_model) = resolve_route(config, requested_model);
         if candidates.is_empty() {
+            if let Some(client) = &raw_client {
+                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                    client,
+                    &format!("No upstream exposes model '{requested_model}'"),
+                ));
+            }
             return (StatusCode::BAD_GATEWAY,
                 Json(json!({ "error": { "message": format!("No upstream exposes model '{}'", requested_model), "type": "no_route" } }))).into_response();
         }
@@ -1571,15 +1647,24 @@ async fn handle_responses_with_config(
                 &real_model,
                 &headers,
                 conversation_id.as_deref(),
+                raw_client.clone(),
             ),
         )
         .await;
         match result {
             Ok(response) => response,
-            Err(error) => (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": { "message": error.to_string(), "type": "failover_exhausted" } })),
-            ).into_response(),
+            Err(error) => {
+                if let Some(client) = &raw_client {
+                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                        client,
+                        &error.to_string(),
+                    ));
+                }
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": { "message": error.to_string(), "type": "failover_exhausted" } })),
+                ).into_response()
+            }
         }
     } else {
         // Streaming: route through candidates in order, dispatching each by its
@@ -1592,6 +1677,12 @@ async fn handle_responses_with_config(
         let (candidates, real_model) = resolve_route(config, requested_model);
         let conversation_id = conversation_id_of(&headers, &body_value);
         if candidates.is_empty() {
+            if let Some(client) = &raw_client {
+                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                    client,
+                    &format!("Responses stream requires an upstream for model '{requested_model}'"),
+                ));
+            }
             return (StatusCode::NOT_IMPLEMENTED,
                 Json(json!({ "error": { "message": "Responses stream requires an openai-responses or openai-completions upstream", "type": "not_supported" } }))).into_response();
         }
@@ -1604,18 +1695,24 @@ async fn handle_responses_with_config(
                 &real_model,
                 &headers,
                 conversation_id.as_deref(),
+                raw_client.clone(),
             ),
         )
         .await;
         match result {
             Ok(resp) => resp,
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(
-                    json!({ "error": { "message": e.to_string(), "type": "failover_exhausted" } }),
-                ),
-            )
-                .into_response(),
+            Err(e) => {
+                if let Some(client) = &raw_client {
+                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &e.to_string()));
+                }
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(
+                        json!({ "error": { "message": e.to_string(), "type": "failover_exhausted" } }),
+                    ),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -1818,6 +1915,43 @@ fn conversation_name_of(headers: &HeaderMap) -> Option<String> {
 /// while forwarding it unchanged (no buffering, token-by-token passthrough),
 /// then run `on_finish` exactly once — on normal end, on error, or when the
 /// stream is dropped mid-flight (client cut the connection).
+/// Capped raw-body accumulator for the raw request log. Stops appending once
+/// the cap is hit and remembers it was truncated.
+struct RawBodyAccumulator {
+    buf: Vec<u8>,
+    truncated: bool,
+    max: usize,
+}
+
+impl RawBodyAccumulator {
+    fn new(max: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(max.min(8192)),
+            truncated: false,
+            max,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        let room = self.max.saturating_sub(self.buf.len());
+        if room >= bytes.len() {
+            self.buf.extend_from_slice(bytes);
+        } else if room > 0 {
+            self.buf.extend_from_slice(&bytes[..room]);
+            self.truncated = true;
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, bool) {
+        (self.buf, self.truncated)
+    }
+}
+
 struct StreamTee<S> {
     inner: S,
     parser: crate::usage::SseUsageParser,
@@ -1825,10 +1959,20 @@ struct StreamTee<S> {
     /// Set when the upstream stream ends with an error; passed to `on_finish`
     /// so an interrupted stream is logged as a failure, not a success.
     error: Option<String>,
+    /// Capped raw body accumulation for the raw request log; `None` when raw
+    /// capture is off for this request.
+    raw: Option<RawBodyAccumulator>,
 }
 
-/// Callback run once when the stream ends: (parsed usage, upstream error).
-type StreamFinish = Box<dyn FnOnce(Option<crate::usage::UsageSummary>, Option<String>) + Send>;
+/// Callback run once when the stream ends: (parsed usage, upstream error,
+/// accumulated raw body — `None` when raw capture is disabled).
+type StreamFinish = Box<
+    dyn FnOnce(
+            Option<crate::usage::UsageSummary>,
+            Option<String>,
+            Option<(Vec<u8>, bool)>,
+        ) + Send,
+>;
 
 impl<S, E> futures_util::Stream for StreamTee<S>
 where
@@ -1844,6 +1988,9 @@ where
         match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 self.parser.push(&bytes);
+                if let Some(acc) = &mut self.raw {
+                    acc.push(&bytes);
+                }
                 std::task::Poll::Ready(Some(Ok(bytes)))
             }
             std::task::Poll::Ready(Some(Err(e))) => {
@@ -1867,18 +2014,23 @@ impl<S> Drop for StreamTee<S> {
 }
 
 impl<S> StreamTee<S> {
-    fn new(inner: S, on_finish: StreamFinish) -> Self {
+    /// `raw_cap` is the per-body capture cap when raw logging is on for this
+    /// request (captured once at request time — the config is not re-read per
+    /// chunk); `None` disables raw accumulation entirely.
+    fn new(inner: S, on_finish: StreamFinish, raw_cap: Option<usize>) -> Self {
         Self {
             inner,
             parser: crate::usage::SseUsageParser::new(),
             on_finish: Some(on_finish),
             error: None,
+            raw: raw_cap.map(RawBodyAccumulator::new),
         }
     }
 
     fn flush_log(&mut self) {
         if let Some(cb) = self.on_finish.take() {
-            cb(self.parser.finish(), self.error.take());
+            let raw = self.raw.take().map(RawBodyAccumulator::finish);
+            cb(self.parser.finish(), self.error.take(), raw);
         }
     }
 }
@@ -1945,6 +2097,72 @@ impl StreamLogFields {
     }
 }
 
+/// Everything needed to write one raw-log entry for a single upstream attempt.
+/// The client request is denormalized into every entry (one entry per attempt),
+/// so entries are self-contained and streaming tees can write them asynchronously
+/// without shared state.
+struct RawLogSpec {
+    client: crate::rawlog::RawClientCapture,
+    provider: String,
+    url: String,
+    status: u16,
+    ok: bool,
+    upstream_headers: Vec<(String, String)>,
+    /// Set when the attempt is an HTTP error passed through (not mid-stream).
+    error: Option<String>,
+}
+
+/// Build a `RawLogSpec` for one attempt when raw capture is enabled for the
+/// request; `None` otherwise (the hot path then pays nothing).
+fn attempt_spec(
+    raw: &Option<crate::rawlog::RawClientCapture>,
+    provider: &str,
+    url: &str,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    ok: bool,
+) -> Option<RawLogSpec> {
+    let client = raw.as_ref()?;
+    Some(RawLogSpec {
+        client: client.clone(),
+        provider: provider.to_string(),
+        url: url.to_string(),
+        status,
+        ok,
+        upstream_headers: crate::rawlog::capture_response_headers(headers),
+        error: None,
+    })
+}
+
+impl RawLogSpec {
+    /// Build + append the entry from a fully-buffered upstream body.
+    fn write_buffered(self, body: &[u8], stream_error: Option<&str>) {
+        let max = crate::rawlog::max_body_bytes();
+        let (body, truncated) = crate::rawlog::cap_bytes(body, max);
+        self.write_capped(&body, truncated, stream_error);
+    }
+
+    /// Build + append the entry from an already-capped body (streaming tees).
+    fn write_capped(self, body: &[u8], truncated: bool, stream_error: Option<&str>) {
+        let error = stream_error.map(|s| s.to_string()).or(self.error);
+        let ok = self.ok && error.is_none();
+        let entry = crate::rawlog::attempt_entry(
+            &self.client,
+            crate::rawlog::RawAttempt {
+                provider: self.provider,
+                url: self.url,
+                status: Some(self.status),
+                ok,
+                headers: self.upstream_headers,
+                body: String::from_utf8_lossy(body).into_owned(),
+                body_truncated: truncated,
+                error,
+            },
+        );
+        crate::rawlog::append_raw_entry(&entry);
+    }
+}
+
 /// Stream an upstream response straight through to the client, preserving status and
 /// headers. Enables token-by-token SSE and keeps Content-Type (which the old buffered
 /// path dropped). Used for same-format passthrough (not the OpenAI↔Anthropic convert path).
@@ -1953,7 +2171,14 @@ impl StreamLogFields {
 /// usage parser while being forwarded unchanged, and the log line (with token usage
 /// and conversation id) is appended once the stream ends — normally, on error, or
 /// when the client cuts the connection.
-fn stream_response(r: reqwest::Response, log: Option<StreamLogFields>) -> Response {
+///
+/// When `raw` is provided (raw request logging enabled), the same tee also
+/// accumulates the raw upstream body (capped) and appends a raw-log entry.
+fn stream_response(
+    r: reqwest::Response,
+    log: Option<StreamLogFields>,
+    raw: Option<RawLogSpec>,
+) -> Response {
     let status = r.status().as_u16();
     let headers = forward_headers(r.headers());
     let mut builder = Response::builder().status(status);
@@ -1961,17 +2186,27 @@ fn stream_response(r: reqwest::Response, log: Option<StreamLogFields>) -> Respon
         builder = builder.header(name, value);
     }
 
-    let body = match log {
-        Some(fields) => {
-            let tee = StreamTee::new(
-                r.bytes_stream(),
-                Box::new(move |usage, error| {
-                    append_log_line(&stream_log_entry(fields, usage.as_ref(), error));
-                }),
-            );
-            Body::from_stream(tee)
-        }
-        None => Body::from_stream(r.bytes_stream()),
+    let body = if log.is_some() || raw.is_some() {
+        // Capture the cap once at request time; never re-read the config per chunk.
+        let raw_cap = raw.as_ref().map(|_| crate::rawlog::max_body_bytes());
+        let tee = StreamTee::new(
+            r.bytes_stream(),
+            Box::new(move |usage, error, raw_body| {
+                if let Some(fields) = log {
+                    append_log_line(&stream_log_entry(fields, usage.as_ref(), error.clone()));
+                }
+                if let Some(spec) = raw {
+                    match raw_body {
+                        Some((body, truncated)) => spec.write_capped(&body, truncated, error.as_deref()),
+                        None => spec.write_buffered(&[], error.as_deref()),
+                    }
+                }
+            }),
+            raw_cap,
+        );
+        Body::from_stream(tee)
+    } else {
+        Body::from_stream(r.bytes_stream())
     };
 
     builder.body(body).unwrap_or_else(|_| {
@@ -2123,6 +2358,7 @@ async fn forward_responses_mixed(
     real_model: &str,
     headers: &HeaderMap,
     conversation_id: Option<&str>,
+    raw: Option<crate::rawlog::RawClientCapture>,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -2244,6 +2480,11 @@ async fn forward_responses_mixed(
                         lookup_model_cost(&profile, &effective),
                     )
                     .await;
+                    if let Some(spec) =
+                        attempt_spec(&raw, name, &url, status.as_u16(), &response_headers, true)
+                    {
+                        spec.write_buffered(&body_bytes, None);
+                    }
                     return Ok(buffered_response(status, &response_headers, body_bytes));
                 }
                 // Convert: map the chat body to Responses semantics.
@@ -2270,6 +2511,16 @@ async fn forward_responses_mixed(
                                     lookup_model_cost(&profile, &effective),
                                 )
                                 .await;
+                                if let Some(spec) = attempt_spec(
+                                    &raw,
+                                    name,
+                                    &url,
+                                    status.as_u16(),
+                                    &response_headers,
+                                    true,
+                                ) {
+                                    spec.write_buffered(&body_bytes, None);
+                                }
                                 let s = serde_json::to_string(&responses_body).unwrap_or_default();
                                 return Ok(Response::builder()
                                     .status(200)
@@ -2292,6 +2543,16 @@ async fn forward_responses_mixed(
                                     None,
                                 )
                                 .await;
+                                if let Some(spec) = attempt_spec(
+                                    &raw,
+                                    name,
+                                    &url,
+                                    status.as_u16(),
+                                    &response_headers,
+                                    false,
+                                ) {
+                                    spec.write_buffered(&body_bytes, Some("conversion_error"));
+                                }
                                 conversion_error = Some(error);
                             }
                         }
@@ -2313,6 +2574,11 @@ async fn forward_responses_mixed(
                             None,
                         )
                         .await;
+                        if let Some(spec) =
+                            attempt_spec(&raw, name, &url, status.as_u16(), &response_headers, true)
+                        {
+                            spec.write_buffered(&body_bytes, None);
+                        }
                         return Ok(buffered_response(status, &response_headers, body_bytes));
                     }
                 }
@@ -2336,6 +2602,13 @@ async fn forward_responses_mixed(
                     conversation_name.as_deref(),
                 )
                 .await;
+                // Capture the retryable error body raw too (rate-limit details
+                // are usually only visible there).
+                if let Some(spec) = attempt_spec(&raw, name, &url, status, upstream.headers(), false)
+                {
+                    let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+                    spec.write_buffered(&body_bytes, Some(&format!("HTTP {status}")));
+                }
                 circuit_state = read_circuit_state().await;
             }
             Ok(upstream) => {
@@ -2352,6 +2625,11 @@ async fn forward_responses_mixed(
                     conversation_name.as_deref(),
                 )
                 .await;
+                if let Some(spec) =
+                    attempt_spec(&raw, name, &url, status.as_u16(), &response_headers, false)
+                {
+                    spec.write_buffered(&body_bytes, None);
+                }
                 return Ok(buffered_response(status, &response_headers, body_bytes));
             }
             Err(error) => {
@@ -2367,6 +2645,9 @@ async fn forward_responses_mixed(
                     conversation_name.as_deref(),
                 )
                 .await;
+                if let Some(client) = &raw {
+                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &message));
+                }
                 circuit_state = read_circuit_state().await;
             }
         }
@@ -2390,6 +2671,7 @@ async fn forward_responses_mixed_stream(
     real_model: &str,
     headers: &HeaderMap,
     conversation_id: Option<&str>,
+    raw: Option<crate::rawlog::RawClientCapture>,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -2503,7 +2785,8 @@ async fn forward_responses_mixed_stream(
                         conversation_name.as_deref(),
                     );
                     fields.cost = lookup_model_cost(&profile, &effective);
-                    return Ok(stream_response(upstream, Some(fields)));
+                    let spec = attempt_spec(&raw, name, &url, status, upstream.headers(), true);
+                    return Ok(stream_response(upstream, Some(fields), spec));
                 }
                 // Convert: the upstream must be an SSE stream; anything else is
                 // an upstream error passed through as-is, not a success.
@@ -2516,6 +2799,16 @@ async fn forward_responses_mixed_stream(
                     let response_status = upstream.status();
                     let response_headers = upstream.headers().clone();
                     let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+                    if let Some(spec) = attempt_spec(
+                        &raw,
+                        name,
+                        &url,
+                        response_status.as_u16(),
+                        &response_headers,
+                        false,
+                    ) {
+                        spec.write_buffered(&body_bytes, Some("expected SSE, got non-stream"));
+                    }
                     return Ok(buffered_response(
                         response_status,
                         &response_headers,
@@ -2538,8 +2831,13 @@ async fn forward_responses_mixed_stream(
                 );
                 fields.cost = lookup_model_cost(&profile, &effective);
                 let converter = ChatSseToResponses::new(&effective);
-                let transform =
-                    ResponsesStreamTransform::new(upstream.bytes_stream(), converter, fields);
+                let spec = attempt_spec(&raw, name, &url, 200, upstream.headers(), true);
+                let transform = ResponsesStreamTransform::new(
+                    upstream.bytes_stream(),
+                    converter,
+                    fields,
+                    spec,
+                );
                 return Ok(builder.body(Body::from_stream(transform)).unwrap());
             }
             Ok(upstream) if should_retry(upstream.status().as_u16()) => {
@@ -2561,6 +2859,12 @@ async fn forward_responses_mixed_stream(
                     conversation_name.as_deref(),
                 )
                 .await;
+                // Capture the retryable error body raw too.
+                if let Some(spec) = attempt_spec(&raw, name, &url, status, upstream.headers(), false)
+                {
+                    let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+                    spec.write_buffered(&body_bytes, Some(&format!("HTTP {status}")));
+                }
                 circuit_state = read_circuit_state().await;
             }
             Ok(upstream) => {
@@ -2577,6 +2881,11 @@ async fn forward_responses_mixed_stream(
                     conversation_name.as_deref(),
                 )
                 .await;
+                if let Some(spec) =
+                    attempt_spec(&raw, name, &url, status.as_u16(), &response_headers, false)
+                {
+                    spec.write_buffered(&body_bytes, None);
+                }
                 return Ok(buffered_response(status, &response_headers, body_bytes));
             }
             Err(error) => {
@@ -2592,6 +2901,9 @@ async fn forward_responses_mixed_stream(
                     conversation_name.as_deref(),
                 )
                 .await;
+                if let Some(client) = &raw {
+                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &message));
+                }
                 circuit_state = read_circuit_state().await;
             }
         }
@@ -2629,6 +2941,7 @@ async fn forward_with_failover(
     headers: &HeaderMap,
     conversation_id: Option<&str>,
     log_stream: bool,
+    raw: Option<crate::rawlog::RawClientCapture>,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -2736,8 +3049,11 @@ async fn forward_with_failover(
             match resp {
                 Ok(r) => {
                     let status = r.status();
+                    let response_headers = r.headers().clone();
                     if status.is_success() {
-                        let anthro_data: Value = r.json().await.unwrap_or(Value::Null);
+                        let body_bytes = r.bytes().await.unwrap_or_default();
+                        let anthro_data: Value =
+                            serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
                         let usage = crate::usage::extract_usage(&anthro_data);
                         let openai_data = anthropic_to_openai_response(&anthro_data);
                         record_success(name, is_half_open).await;
@@ -2755,20 +3071,30 @@ async fn forward_with_failover(
                             lookup_model_cost(&profile, &effective),
                         )
                         .await;
+                        if let Some(spec) = attempt_spec(
+                            &raw,
+                            name,
+                            &url,
+                            status.as_u16(),
+                            &response_headers,
+                            true,
+                        ) {
+                            spec.write_buffered(&body_bytes, None);
+                        }
                         return Ok(Json(openai_data).into_response());
                     } else if should_retry(status.as_u16()) {
                         let status_code = status.as_u16();
                         record_failure(
                             name,
                             circuit_settings,
-                            &format!("HTTP {}", status_code),
+                            &format!("HTTP {status_code}"),
                             is_half_open,
                         )
                         .await;
                         log_request(
                             name,
                             false,
-                            Some(&format!("HTTP {}", status_code)),
+                            Some(&format!("HTTP {status_code}")),
                             Some(status_code),
                             Some(&url),
                             None,
@@ -2779,6 +3105,13 @@ async fn forward_with_failover(
                             None,
                         )
                         .await;
+                        // Capture the retryable error body raw too.
+                        if let Some(spec) =
+                            attempt_spec(&raw, name, &url, status_code, r.headers(), false)
+                        {
+                            let body_bytes = r.bytes().await.unwrap_or_default();
+                            spec.write_buffered(&body_bytes, Some(&format!("HTTP {status_code}")));
+                        }
                         circuit_state = read_circuit_state().await;
                         continue;
                     } else {
@@ -2797,6 +3130,16 @@ async fn forward_with_failover(
                             None,
                         )
                         .await;
+                        if let Some(spec) = attempt_spec(
+                            &raw,
+                            name,
+                            &url,
+                            status.as_u16(),
+                            &response_headers,
+                            false,
+                        ) {
+                            spec.write_buffered(&body_bytes, None);
+                        }
                         return Ok(Response::builder()
                             .status(status.as_u16())
                             .body(Body::from(body_bytes))
@@ -2819,6 +3162,12 @@ async fn forward_with_failover(
                         None,
                     )
                     .await;
+                    if let Some(client) = &raw {
+                        crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                            client,
+                            &e.to_string(),
+                        ));
+                    }
                     circuit_state = read_circuit_state().await;
                     continue;
                 }
@@ -2868,20 +3217,21 @@ async fn forward_with_failover(
                         } else {
                             None
                         };
-                        return Ok(stream_response(r, log));
+                        let spec = attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), true);
+                        return Ok(stream_response(r, log, spec));
                     } else if should_retry(status.as_u16()) {
                         let status_code = status.as_u16();
                         record_failure(
                             name,
                             circuit_settings,
-                            &format!("HTTP {}", status_code),
+                            &format!("HTTP {status_code}"),
                             is_half_open,
                         )
                         .await;
                         log_request(
                             name,
                             false,
-                            Some(&format!("HTTP {}", status_code)),
+                            Some(&format!("HTTP {status_code}")),
                             Some(status_code),
                             Some(&url),
                             None,
@@ -2892,6 +3242,13 @@ async fn forward_with_failover(
                             None,
                         )
                         .await;
+                        // Capture the retryable error body raw too.
+                        if let Some(spec) =
+                            attempt_spec(&raw, name, &url, status_code, r.headers(), false)
+                        {
+                            let body_bytes = r.bytes().await.unwrap_or_default();
+                            spec.write_buffered(&body_bytes, Some(&format!("HTTP {status_code}")));
+                        }
                         circuit_state = read_circuit_state().await;
                         continue;
                     } else {
@@ -2910,7 +3267,8 @@ async fn forward_with_failover(
                             None,
                         )
                         .await;
-                        return Ok(stream_response(r, None));
+                        let spec = attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), false);
+                        return Ok(stream_response(r, None, spec));
                     }
                 }
                 Err(e) => {
@@ -2929,6 +3287,12 @@ async fn forward_with_failover(
                         None,
                     )
                     .await;
+                    if let Some(client) = &raw {
+                        crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                            client,
+                            &e.to_string(),
+                        ));
+                    }
                     circuit_state = read_circuit_state().await;
                     continue;
                 }
@@ -2946,6 +3310,7 @@ async fn forward_anthropic_with_failover(
     real_model: &str,
     headers: &HeaderMap,
     conversation_id: Option<&str>,
+    raw: Option<crate::rawlog::RawClientCapture>,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -3030,7 +3395,8 @@ async fn forward_anthropic_with_failover(
                         conversation_name.as_deref(),
                     );
                     fields.cost = lookup_model_cost(&profile, &effective);
-                    return Ok(stream_response(r, Some(fields)));
+                    let spec = attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), true);
+                    return Ok(stream_response(r, Some(fields), spec));
                 }
                 log_request(
                     name,
@@ -3047,22 +3413,34 @@ async fn forward_anthropic_with_failover(
                 )
                 .await;
                 // Non-retryable error: pass the upstream response through unchanged.
-                return Ok(stream_response(r, None));
+                let spec = attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), false);
+                return Ok(stream_response(r, None, spec));
             }
             Ok(r) => {
                 let status = r.status().as_u16();
                 record_failure(
                     name,
                     circuit_settings,
-                    &format!("HTTP {}", status),
+                    &format!("HTTP {status}"),
                     is_half_open,
                 )
                 .await;
+                // Capture the retryable error body raw too.
+                if let Some(spec) = attempt_spec(&raw, name, &url, status, r.headers(), false) {
+                    let body_bytes = r.bytes().await.unwrap_or_default();
+                    spec.write_buffered(&body_bytes, Some(&format!("HTTP {status}")));
+                }
                 circuit_state = read_circuit_state().await;
                 continue;
             }
             Err(e) => {
                 record_failure(name, circuit_settings, &e.to_string(), is_half_open).await;
+                if let Some(client) = &raw {
+                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                        client,
+                        &e.to_string(),
+                    ));
+                }
                 circuit_state = read_circuit_state().await;
                 continue;
             }
@@ -5527,18 +5905,35 @@ mod tests {
 
     type TeeSlot = (
         std::sync::Arc<
-            std::sync::Mutex<Option<(Option<crate::usage::UsageSummary>, Option<String>)>>,
+            std::sync::Mutex<
+                Option<(
+                    Option<crate::usage::UsageSummary>,
+                    Option<String>,
+                    Option<(Vec<u8>, bool)>,
+                )>,
+            >,
         >,
-        Box<dyn FnOnce(Option<crate::usage::UsageSummary>, Option<String>) + Send>,
+        Box<
+            dyn FnOnce(
+                    Option<crate::usage::UsageSummary>,
+                    Option<String>,
+                    Option<(Vec<u8>, bool)>,
+                ) + Send,
+        >,
     );
 
     fn tee_slot() -> TeeSlot {
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle = slot.clone();
-        let cb: Box<dyn FnOnce(Option<crate::usage::UsageSummary>, Option<String>) + Send> =
-            Box::new(move |summary, error| {
-                *handle.lock().unwrap() = Some((summary, error));
-            });
+        let cb: Box<
+            dyn FnOnce(
+                    Option<crate::usage::UsageSummary>,
+                    Option<String>,
+                    Option<(Vec<u8>, bool)>,
+                ) + Send,
+        > = Box::new(move |summary, error, raw| {
+            *handle.lock().unwrap() = Some((summary, error, raw));
+        });
         (slot, cb)
     }
 
@@ -5559,7 +5954,7 @@ mod tests {
         let (slot, cb) = tee_slot();
         let chunks: Vec<std::result::Result<Bytes, std::io::Error>> =
             vec![Ok(Bytes::from(openai_stream()))];
-        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb);
+        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb, None);
 
         let out: Vec<Bytes> = tee.try_collect().await.unwrap();
         assert_eq!(
@@ -5568,7 +5963,7 @@ mod tests {
             "chunks pass through"
         );
 
-        let summary = slot.lock().unwrap().take().and_then(|(s, _)| s).unwrap();
+        let summary = slot.lock().unwrap().take().and_then(|(s, _, _)| s).unwrap();
         assert_eq!(
             (
                 summary.prompt_tokens,
@@ -5592,7 +5987,7 @@ mod tests {
         ];
 
         let (slot, cb) = tee_slot();
-        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb);
+        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb, None);
         let out: Vec<Bytes> = tee.try_collect().await.unwrap();
 
         let joined: String = out
@@ -5601,7 +5996,7 @@ mod tests {
             .collect();
         assert_eq!(joined, stream, "chunks reassemble to the original stream");
 
-        let summary = slot.lock().unwrap().take().and_then(|(s, _)| s).unwrap();
+        let summary = slot.lock().unwrap().take().and_then(|(s, _, _)| s).unwrap();
         assert_eq!(
             (
                 summary.prompt_tokens,
@@ -5623,12 +6018,12 @@ mod tests {
         );
         let (slot, cb) = tee_slot();
         let chunks: Vec<std::result::Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(stream))];
-        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb);
+        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb, None);
 
         tee.try_collect::<Vec<Bytes>>().await.unwrap();
         assert_eq!(
             *slot.lock().unwrap(),
-            Some((None, None)),
+            Some((None, None, None)),
             "callback runs with no usage"
         );
     }
@@ -5645,13 +6040,14 @@ mod tests {
                 Err(std::io::Error::other("upstream died")),
             ]),
             cb,
+            None,
         );
 
         let err = tee.try_collect::<Vec<Bytes>>().await.unwrap_err();
         assert!(err.to_string().contains("upstream died"));
         assert_eq!(
             *slot.lock().unwrap(),
-            Some((None, Some("upstream died".to_string()))),
+            Some((None, Some("upstream died".to_string()), None)),
             "error end still triggers the callback"
         );
     }
@@ -5668,13 +6064,13 @@ mod tests {
         let (slot, cb) = tee_slot();
         let chunks: Vec<std::result::Result<Bytes, std::io::Error>> =
             vec![Ok(Bytes::from(stream)), Ok(Bytes::from("data: [DONE]\n\n"))];
-        let mut tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb);
+        let mut tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb, None);
 
         let first = tee.try_next().await.unwrap().unwrap();
         assert_eq!(first, Bytes::from(stream));
         drop(tee);
 
-        let summary = slot.lock().unwrap().take().and_then(|(s, _)| s).unwrap();
+        let summary = slot.lock().unwrap().take().and_then(|(s, _, _)| s).unwrap();
         assert_eq!(
             (
                 summary.prompt_tokens,
@@ -5686,6 +6082,144 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn raw_log_captures_streamed_request_and_upstream_body() {
+        // Serialize with the other raw-log tests (shared state dir file).
+        let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Upstream that streams an OpenAI SSE response.
+        let upstream_body = concat!(
+            "data: {\"id\":\"chatcmpl-raw\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let upstream_body = upstream_body.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .header("x-upstream-probe", "yes")
+                        .body(Body::from(upstream_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let config = cfg(
+            serde_json::json!({
+                "p1": {
+                    "api": "openai-completions",
+                    "baseUrl": format!("http://{}/v1", address),
+                    "apiKey": "upstream-key",
+                    "exposedModels": ["m1"]
+                }
+            }),
+            vec![],
+        );
+        let body = serde_json::json!({
+            "model": "p1/m1",
+            "messages": [{ "role": "user", "content": "hello" }],
+        });
+        let headers = HeaderMap::new();
+
+        // Raw capture is armed by passing the capture along (the handler builds
+        // this from the client request; here it is deterministic for the test).
+        let raw = Some(crate::rawlog::RawClientCapture {
+            request_id: "req-raw-1".to_string(),
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers: vec![("authorization".to_string(), "Bearer ***".to_string())],
+            body: body.to_string(),
+            body_truncated: false,
+        });
+
+        let resp = super::forward_with_failover(
+            &config,
+            &["p1".to_string()],
+            &body,
+            "m1",
+            "chat/completions",
+            &headers,
+            None,
+            true,
+            raw,
+        )
+        .await
+        .expect("upstream succeeds");
+        let _ = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+
+        // The tee flushes the raw entry when the stream ends.
+        let log_path = super::init_test_state_dir().join(crate::rawlog::RAW_LOG_FILE);
+        let text = std::fs::read_to_string(&log_path).expect("raw log written");
+        let entry: serde_json::Value =
+            serde_json::from_str(text.lines().last().expect("one entry")).unwrap();
+        assert_eq!(entry["requestId"], "req-raw-1");
+        assert_eq!(entry["client"]["path"], "/v1/chat/completions");
+        assert_eq!(entry["client"]["headers"]["authorization"], "Bearer ***");
+        assert!(entry["client"]["body"].as_str().unwrap().contains("\"model\":\"p1/m1\""));
+        assert_eq!(entry["attempt"]["provider"], "p1");
+        assert_eq!(entry["attempt"]["status"], 200);
+        assert_eq!(
+            entry["attempt"]["headers"]["x-upstream-probe"],
+            "yes",
+            "upstream response headers captured"
+        );
+        assert!(
+            entry["attempt"]["body"].as_str().unwrap().contains("chatcmpl-raw"),
+            "raw SSE body captured"
+        );
+        assert_eq!(entry["ok"], true);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_log_error_entry_when_no_route_and_on_failover_exhaustion() {
+        // Serialize with the other raw-log tests (shared state dir file).
+        let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // No route: the request never reaches an upstream — a client-only entry
+        // with the error is written.
+        let config = cfg(serde_json::json!({}), vec![]);
+        let raw = Some(crate::rawlog::RawClientCapture {
+            request_id: "req-raw-2".to_string(),
+            ts: "2025-01-01T00:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![],
+            body: "{\"model\":\"x/y\"}".to_string(),
+            body_truncated: false,
+        });
+        let response = super::handle_responses_with_raw(
+            &config,
+            HeaderMap::new(),
+            "{\"model\":\"x/y\"}".to_string(),
+            raw,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let log_path = super::init_test_state_dir().join(crate::rawlog::RAW_LOG_FILE);
+        let text = std::fs::read_to_string(&log_path).expect("raw log written");
+        let entry: serde_json::Value =
+            serde_json::from_str(text.lines().last().expect("one entry")).unwrap();
+        assert_eq!(entry["requestId"], "req-raw-2");
+        assert!(entry["attempt"].is_null());
+        assert!(entry["error"].as_str().unwrap().contains("No upstream exposes model"));
+        assert_eq!(entry["ok"], false);
+    }
+
     #[test]
     fn stream_tee_drop_mid_stream_without_usage_reports_none() {
         use axum::body::Bytes;
@@ -5693,10 +6227,10 @@ mod tests {
         let (slot, cb) = tee_slot();
         let chunks: Vec<std::result::Result<Bytes, std::io::Error>> =
             vec![Ok(Bytes::from("data: {\"id\":\"1\"}\n\n"))];
-        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb);
+        let tee = super::StreamTee::new(futures_util::stream::iter(chunks), cb, None);
 
         drop(tee);
-        assert_eq!(*slot.lock().unwrap(), Some((None, None)));
+        assert_eq!(*slot.lock().unwrap(), Some((None, None, None)));
     }
     #[test]
     fn stream_log_entry_marks_interrupted_stream_as_failed() {
@@ -6019,6 +6553,7 @@ mod tests {
             &headers,
             None,
             true,
+            None,
         )
         .await
         .expect("upstream succeeds");

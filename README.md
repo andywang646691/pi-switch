@@ -170,6 +170,18 @@ Every proxied request is appended to `~/.pi-switch/requests.log` as a JSON line.
 
 ---
 
+## 🔍 Raw Request/Response Log (Web UI only)
+
+In addition to the metadata log (`requests.log`), the proxy writes the **raw client request** and the **raw upstream response** for every upstream attempt to `~/.pi-switch/raw-requests.log` (JSON Lines), so you can analyze byte-for-byte what was sent and what the upstream returned.
+
+- **What is captured**: the client request (method, path, headers, raw body) plus each upstream attempt (provider, URL, status, upstream response headers, raw response body — SSE streams are accumulated chunk-by-chunk). Failover attempts against the same client request share a `requestId`; each attempt is its own entry so you can compare what each upstream returned.
+- **Credentials are masked**: `authorization` / `x-api-key` / `cookie` / `set-cookie` header values are redacted (e.g. `Bearer ***`); hop-by-hop headers (`host`, `content-length`, …) are not recorded.
+- **Size cap**: a request or response body is captured up to 2 MiB by default (`settings.proxy.rawLog.maxBodyBytes`); longer bodies are kept from the head and flagged `bodyTruncated`, so long streams cannot balloon memory or disk.
+- **Viewable only in the Web UI**: the CLI and TUI never read this file. The WebUI **Raw Logs** page auto-refreshes (5s/30s/5min), groups attempts per request, expands into the raw headers/bodies, and can clear everything. API: `GET /api/rawlogs` (list, metadata only), `GET /api/rawlogs/:id` (single entry with bodies), `DELETE /api/rawlogs` (clear).
+- **Toggle**: enabled by default; the Settings → Proxy card can disable capture (`settings.proxy.rawLog.enabled`).
+
+---
+
 ## 🎯 Core Workflow
 
 ### Gateway Routing & Failover

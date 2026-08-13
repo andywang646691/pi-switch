@@ -284,6 +284,32 @@ pub struct ProxySettings {
     pub circuit_breaker: CircuitBreakerSettings,
     #[serde(default, rename = "monitor")]
     pub monitor: MonitorSettings,
+    /// Raw request/response capture (viewable only in the Web UI).
+    #[serde(default, rename = "rawLog")]
+    pub raw_log: RawLogSettings,
+}
+
+/// Raw request/response log: captures the client's raw request and the raw
+/// upstream response per attempt into `raw-requests.log`, so issues can be
+/// analyzed byte-for-byte from the Web UI (the TUI/CLI never read it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawLogSettings {
+    #[serde(default = "default_raw_log_enabled")]
+    pub enabled: bool,
+    /// Maximum captured bytes per body (request or response). Longer bodies
+    /// are kept from the head and flagged `bodyTruncated`.
+    #[serde(default = "default_raw_log_max_body")]
+    #[serde(rename = "maxBodyBytes")]
+    pub max_body_bytes: usize,
+}
+
+impl Default for RawLogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_raw_log_enabled(),
+            max_body_bytes: default_raw_log_max_body(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +360,12 @@ pub struct PiSwitchConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_raw_log_enabled() -> bool {
+    true
+}
+fn default_raw_log_max_body() -> usize {
+    2 * 1024 * 1024
 }
 fn default_failure_threshold() -> u32 {
     3
@@ -401,6 +433,7 @@ impl Default for PiSwitchConfig {
                         cooldown_seconds: 60,
                     },
                     monitor: MonitorSettings::default(),
+                    raw_log: RawLogSettings::default(),
                 },
                 web: WebSettings {
                     host: default_web_host(),
@@ -1172,5 +1205,27 @@ mod tests {
         .expect("valid provider");
         let value = serde_json::to_value(profile).expect("serializable provider");
         assert_eq!(value["responsesMode"], "passthrough");
+    }
+
+    #[test]
+    fn raw_log_settings_default_to_enabled_with_cap_and_round_trip_camel_case() {
+        use super::Settings;
+
+        // Missing field → defaults (enabled, 2 MiB cap) so existing configs
+        // keep working and capture is on out of the box.
+        let settings: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(settings.proxy.raw_log.enabled);
+        assert_eq!(settings.proxy.raw_log.max_body_bytes, 2 * 1024 * 1024);
+
+        // Explicit values round-trip under the camelCase JSON key.
+        let parsed: Settings = serde_json::from_value(serde_json::json!({
+            "proxy": { "rawLog": { "enabled": false, "maxBodyBytes": 4096 } }
+        }))
+        .unwrap();
+        assert!(!parsed.proxy.raw_log.enabled);
+        assert_eq!(parsed.proxy.raw_log.max_body_bytes, 4096);
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(serialized["proxy"]["rawLog"]["maxBodyBytes"], 4096);
     }
 }

@@ -10,6 +10,7 @@ mod package;
 mod package_ops;
 mod presets;
 mod proxy;
+mod rawlog;
 mod service;
 mod stats;
 mod sync;
