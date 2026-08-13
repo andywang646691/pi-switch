@@ -518,6 +518,10 @@ pub fn sync_gateway_to_pi() -> Result<()> {
                     ..Default::default()
                 });
             entry.id = format!("{}/{}", name, real_id);
+            // Fill thinkingLevelMap from the opencode catalog's `reasoning_options`
+            // when the profile entry has none, so pi exposes the model's true effort
+            // range (e.g. opencode/deepseek-v4-flash advertises low/high/max).
+            crate::models::catalog().fill_thinking_level_map(&mut entry);
             // Console Go (opencode.ai) rejects OpenAI's `developer` role. pi only
             // auto-detects that for providers/baseUrls literally named opencode, so
             // advertise the capability explicitly and pi sends `system` instead.

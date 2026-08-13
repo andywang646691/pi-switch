@@ -207,6 +207,90 @@ impl ModelCatalog {
                 });
             }
         }
+        // models.dev carries the provider's advertised reasoning controls in
+        // `reasoning_options` (e.g. `{type:"effort", values:["low","high","max"]}`
+        // for deepseek-v4-flash). Translate them into pi's `thinkingLevelMap` so the
+        // true effort range (including `max`) shows up in pi; explicit user maps and
+        // explicitly-disabled reasoning always win.
+        if entry.thinking_level_map.is_none() && entry.reasoning != Some(false) {
+            if let Some(map) = thinking_level_map_from_meta(meta) {
+                entry.thinking_level_map = Some(map);
+            }
+        }
+        true
+    }
+}
+
+/// Build a pi `thinkingLevelMap` from a models.dev entry's `reasoning_options`.
+///
+/// Every advertised effort value maps to the identically-named pi level; levels the
+/// upstream does not list become `null` (hidden in pi's UI). `off` is only hidden
+/// when the model cannot toggle thinking off (no `toggle` option and no `none`
+/// effort value). Returns `None` when the catalog entry has no usable `effort`
+/// option, leaving the entry's default off..high range untouched.
+fn thinking_level_map_from_meta(meta: &Value) -> Option<Value> {
+    let options = meta.get("reasoning_options")?.as_array()?;
+    let mut has_toggle = false;
+    let mut effort_values: Vec<String> = Vec::new();
+    for option in options {
+        match option.get("type").and_then(Value::as_str) {
+            Some("toggle") => has_toggle = true,
+            Some("effort") => {
+                if let Some(values) = option.get("values").and_then(Value::as_array) {
+                    effort_values = values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    if effort_values.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    for level in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+        let supported = effort_values.iter().any(|v| v == level);
+        map.insert(
+            level.to_string(),
+            if supported {
+                serde_json::Value::String(level.to_string())
+            } else {
+                serde_json::Value::Null
+            },
+        );
+    }
+    // `off` stays available via the provider's default mapping unless the model
+    // cannot disable thinking.
+    if !has_toggle && !effort_values.iter().any(|v| v == "none") {
+        map.insert("off".to_string(), serde_json::Value::Null);
+    }
+    Some(serde_json::Value::Object(map))
+}
+
+impl ModelCatalog {
+    /// Fill `entry.thinking_level_map` from the catalog's `reasoning_options` when
+    /// the entry has no explicit map (explicit user values always win). Namespaced
+    /// ids are resolved exactly first, then fall back to the bare model id. Returns
+    /// `true` when a map was applied.
+    pub fn fill_thinking_level_map(&self, entry: &mut ModelEntry) -> bool {
+        if entry.thinking_level_map.is_some() || entry.reasoning == Some(false) {
+            return false;
+        }
+        let mut meta = self.lookup(&entry.id);
+        if meta.is_none() {
+            if let Some((_, rest)) = entry.id.split_once('/') {
+                meta = self.lookup(rest);
+            }
+        }
+        let Some(meta) = meta else { return false; };
+        let Some(map) = thinking_level_map_from_meta(meta) else {
+            return false;
+        };
+        entry.thinking_level_map = Some(map);
         true
     }
 }
@@ -464,5 +548,167 @@ mod tests {
         let mut with_cost = with_cost;
         with_cost.cost = Some(ModelCost::default());
         assert!(!is_unparameterized(&with_cost));
+    }
+
+    #[test]
+    fn reasoning_options_build_thinking_level_map() {
+        // deepseek-v4-flash: toggle + effort [low, high, max] (as models.dev reports).
+        let catalog = catalog_with(json!({
+            "opencode": {
+                "id": "opencode",
+                "models": {
+                    "deepseek-v4-flash": {
+                        "id": "deepseek-v4-flash",
+                        "reasoning": true,
+                        "reasoning_options": [
+                            { "type": "toggle" },
+                            { "type": "effort", "values": ["low", "high", "max"] }
+                        ]
+                    }
+                }
+            }
+        }));
+        let mut entry = ModelEntry {
+            id: "deepseek-v4-flash".into(),
+            reasoning: Some(true),
+            ..Default::default()
+        };
+        assert!(catalog.enrich(&mut entry));
+        let map = entry.thinking_level_map.expect("map filled");
+        assert_eq!(map["minimal"], serde_json::Value::Null);
+        assert_eq!(map["low"], "low");
+        assert_eq!(map["medium"], serde_json::Value::Null);
+        assert_eq!(map["high"], "high");
+        assert_eq!(map["xhigh"], serde_json::Value::Null);
+        assert_eq!(map["max"], "max");
+        // toggle present → off stays available via the provider default mapping
+        assert!(map.get("off").is_none());
+    }
+
+    #[test]
+    fn effort_without_toggle_hides_off() {
+        let catalog = catalog_with(json!({
+            "openai": {
+                "id": "openai",
+                "models": {
+                    "glm-5.2": {
+                        "id": "glm-5.2",
+                        "reasoning": true,
+                        "reasoning_options": [
+                            { "type": "effort", "values": ["high", "max"] }
+                        ]
+                    }
+                }
+            }
+        }));
+        let mut entry = ModelEntry {
+            id: "glm-5.2".into(),
+            reasoning: Some(true),
+            ..Default::default()
+        };
+        assert!(catalog.enrich(&mut entry));
+        let map = entry.thinking_level_map.expect("map filled");
+        assert_eq!(map["off"], serde_json::Value::Null);
+        assert_eq!(map["low"], serde_json::Value::Null);
+        assert_eq!(map["max"], "max");
+    }
+
+    #[test]
+    fn no_reasoning_options_leaves_map_unset() {
+        let catalog = catalog_with(json!({
+            "openai": {
+                "id": "openai",
+                "models": {
+                    "deepseek-chat": {
+                        "id": "deepseek-chat",
+                        "reasoning": false
+                    }
+                }
+            }
+        }));
+        let mut entry = ModelEntry {
+            id: "deepseek-chat".into(),
+            reasoning: Some(false),
+            ..Default::default()
+        };
+        assert!(catalog.enrich(&mut entry));
+        assert!(entry.thinking_level_map.is_none());
+    }
+
+    #[test]
+    fn explicit_thinking_level_map_wins() {
+        let catalog = catalog_with(json!({
+            "opencode": {
+                "id": "opencode",
+                "models": {
+                    "deepseek-v4-flash": {
+                        "id": "deepseek-v4-flash",
+                        "reasoning": true,
+                        "reasoning_options": [
+                            { "type": "effort", "values": ["low", "high", "max"] }
+                        ]
+                    }
+                }
+            }
+        }));
+        let mut entry = ModelEntry {
+            id: "deepseek-v4-flash".into(),
+            reasoning: Some(true),
+            thinking_level_map: Some(serde_json::json!({ "high": "high" })),
+            ..Default::default()
+        };
+        assert!(catalog.enrich(&mut entry));
+        assert_eq!(
+            entry.thinking_level_map,
+            Some(serde_json::json!({ "high": "high" }))
+        );
+    }
+
+    #[test]
+    fn fill_thinking_level_map_resolves_namespaced_and_bare() {
+        let catalog = catalog_with(json!({
+            "opencode": {
+                "id": "opencode",
+                "models": {
+                    "deepseek-v4-flash": {
+                        "id": "deepseek-v4-flash",
+                        "reasoning": true,
+                        "reasoning_options": [
+                            { "type": "effort", "values": ["low", "high", "max"] }
+                        ]
+                    }
+                }
+            }
+        }));
+        // Namespaced id matching the catalog provider.
+        let mut entry = ModelEntry {
+            id: "opencode/deepseek-v4-flash".into(),
+            ..Default::default()
+        };
+        assert!(catalog.fill_thinking_level_map(&mut entry));
+        assert_eq!(entry.thinking_level_map.as_ref().unwrap()["max"], "max");
+
+        // Namespaced id with an unknown provider falls back to the bare id.
+        let mut entry = ModelEntry {
+            id: "custom-gateway/deepseek-v4-flash".into(),
+            ..Default::default()
+        };
+        assert!(catalog.fill_thinking_level_map(&mut entry));
+        assert_eq!(entry.thinking_level_map.as_ref().unwrap()["max"], "max");
+
+        // No reasoning_options in the catalog → no map.
+        let mut entry = ModelEntry {
+            id: "no-such-model".into(),
+            ..Default::default()
+        };
+        assert!(!catalog.fill_thinking_level_map(&mut entry));
+
+        // Explicit map is never overwritten.
+        let mut entry = ModelEntry {
+            id: "opencode/deepseek-v4-flash".into(),
+            thinking_level_map: Some(serde_json::json!({ "high": "high" })),
+            ..Default::default()
+        };
+        assert!(!catalog.fill_thinking_level_map(&mut entry));
     }
 }
