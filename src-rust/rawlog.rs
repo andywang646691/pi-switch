@@ -14,6 +14,10 @@
 //! Bodies are capped (default 2 MiB, configurable via
 //! `settings.proxy.rawLog.maxBodyBytes`) so long streams cannot balloon
 //! memory or disk; capped bodies are flagged `bodyTruncated`.
+//!
+//! Only the newest [`MAX_RAW_ENTRIES`] entries are retained — older entries
+//! are dropped on append — so the file size stays bounded no matter how long
+//! the proxy runs.
 
 use crate::config;
 use serde_json::{json, Value};
@@ -23,6 +27,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 pub const RAW_LOG_FILE: &str = "raw-requests.log";
+
+/// How many entries the raw log keeps at most (newest wins). Kept small so
+/// the file stays small and every read stays fast — the Web UI only ever
+/// shows the latest page anyway.
+pub const MAX_RAW_ENTRIES: usize = 10;
 
 /// Serializes tests that read/write the raw log file so parallel test threads
 /// cannot interleave entries and break count/ordering assertions.
@@ -129,6 +138,26 @@ pub fn append_raw_entry(entry: &Value) {
             .open(&log_path)
         {
             let _ = writeln!(file, "{json}");
+        }
+    }
+    trim_to_latest(MAX_RAW_ENTRIES);
+}
+
+/// Drop all but the newest `max` entries by rewriting the file. Best-effort:
+/// if the rewrite fails the file simply keeps more entries than the cap (the
+/// next successful append retries the trim).
+fn trim_to_latest(max: usize) {
+    let entries = read_entries();
+    if entries.len() <= max {
+        return;
+    }
+    let keep = &entries[entries.len() - max..];
+    let log_path = raw_log_path();
+    if let Ok(mut file) = std::fs::File::create(&log_path) {
+        for entry in keep {
+            if let Ok(json) = serde_json::to_string(entry) {
+                let _ = writeln!(file, "{json}");
+            }
         }
     }
 }
@@ -486,5 +515,37 @@ mod tests {
 
         assert_eq!(clear(), 2);
         assert_eq!(count(), 0);
+    }
+
+    #[test]
+    fn append_keeps_only_latest_ten_entries() {
+        let _guard = RAW_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = crate::proxy::init_test_state_dir();
+        let path = dir.join(RAW_LOG_FILE);
+        let _ = std::fs::remove_file(&path);
+
+        let client = RawClientCapture {
+            request_id: "r1".to_string(),
+            ts: "2026-08-13T00:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            headers: vec![],
+            body: "{}".to_string(),
+            body_truncated: false,
+        };
+        for i in 0..12 {
+            append_raw_entry(&error_entry(&client, &format!("e{i}")));
+        }
+
+        assert_eq!(count(), MAX_RAW_ENTRIES);
+        let listed = list(100, 0);
+        assert_eq!(listed.len(), MAX_RAW_ENTRIES);
+        // Newest first: e11 newest, e0/e1 were dropped.
+        assert_eq!(listed[0]["error"], "e11");
+        assert_eq!(listed.last().unwrap()["error"], "e2");
+
+        assert_eq!(clear(), MAX_RAW_ENTRIES);
     }
 }

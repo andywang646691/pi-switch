@@ -3548,6 +3548,52 @@ fn append_log_line(entry: &Value) {
             let _ = writeln!(file, "{}", json);
         }
     }
+    trim_requests_log();
+}
+
+/// How many days of request metadata `requests.log` keeps; older entries are
+/// dropped on append so the file stays bounded (Stats reads the whole file).
+pub const REQUEST_LOG_RETENTION_DAYS: i64 = 7;
+
+/// Drop request-log entries older than [`REQUEST_LOG_RETENTION_DAYS`].
+/// Best-effort, and cheap when nothing is old: the file is only rewritten if
+/// at least one entry is removed. Must be called with `LOG_LOCK` held.
+fn trim_requests_log() {
+    let log_path = state_dir().join("requests.log");
+    let Ok(text) = std::fs::read_to_string(&log_path) else {
+        return;
+    };
+    let cutoff = Utc::now() - chrono::Duration::days(REQUEST_LOG_RETENTION_DAYS);
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        total += 1;
+        let age_ok = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| {
+                let ts = v.get("ts").and_then(|t| t.as_str())?;
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .ok()
+                    .map(|parsed| parsed.with_timezone(&Utc) >= cutoff)
+            })
+            .unwrap_or(true); // rows without a parseable ts are kept
+        if age_ok {
+            kept.push(line.to_string());
+        }
+    }
+    if kept.len() == total {
+        return; // nothing to drop — skip the rewrite
+    }
+    if let Ok(mut file) = std::fs::File::create(&log_path) {
+        use std::io::Write;
+        for line in kept {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3583,8 +3629,8 @@ async fn log_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_private_params, handle_responses_with_config, make_router, normalize_developer_role,
-        resolve_route, ProxyState,
+        append_log_line, filter_private_params, handle_responses_with_config, make_router,
+        normalize_developer_role, resolve_route, ProxyState, REQUEST_LOG_RETENTION_DAYS,
     };
     use crate::config::PiSwitchConfig;
     use axum::{
@@ -3596,6 +3642,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
+
+    #[test]
+    fn requests_log_retains_only_recent_entries() {
+        let dir = super::init_test_state_dir();
+        let path = dir.join("requests.log");
+        let old = serde_json::json!({
+            "ts": (chrono::Utc::now() - chrono::Duration::days(REQUEST_LOG_RETENTION_DAYS + 1))
+                .to_rfc3339(),
+            "ok": true,
+            "provider": "old-provider",
+        });
+        let fresh = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "ok": true,
+            "provider": "fresh-provider",
+        });
+        append_log_line(&old);
+        append_log_line(&fresh);
+
+        let text = std::fs::read_to_string(&path).expect("log written");
+        assert!(text.contains("\"fresh-provider\""), "fresh entry must be kept");
+        assert!(
+            !text.contains("\"old-provider\""),
+            "entry older than the retention window must be trimmed"
+        );
+    }
 
     fn cfg(profiles: serde_json::Value, rules: Vec<crate::config::FailoverRule>) -> PiSwitchConfig {
         let mut c = PiSwitchConfig::default();

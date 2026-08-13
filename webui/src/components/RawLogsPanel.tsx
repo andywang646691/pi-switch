@@ -13,7 +13,9 @@ const REFRESH_TIERS: { label: string; ms: number | null }[] = [
   { label: "5min", ms: 300_000 },
 ];
 
-const PAGE_SIZE = 100;
+// Only the newest 10 entries are kept (see `MAX_RAW_ENTRIES` in rawlog.rs),
+// so listing the latest page shows everything that is stored.
+const PAGE_SIZE = 10;
 
 function formatBytes(n: number | undefined): string {
   if (n == null) return "-";
