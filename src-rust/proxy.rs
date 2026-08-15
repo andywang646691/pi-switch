@@ -684,11 +684,16 @@ async fn handle_chat_completions(
         Ok(resp) => resp,
         Err(e) => {
             if let Some(client) = &raw_client {
-                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &e.to_string()));
+                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                    client,
+                    &e.to_string(),
+                ));
             }
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": { "message": e.to_string(), "type": "failover_exhausted" } })),
+                Json(
+                    json!({ "error": { "message": e.to_string(), "type": "failover_exhausted" } }),
+                ),
             )
                 .into_response()
         }
@@ -759,7 +764,10 @@ async fn handle_messages(
         Ok(resp) => resp,
         Err(e) => {
             if let Some(client) = &raw_client {
-                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &e.to_string()));
+                crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                    client,
+                    &e.to_string(),
+                ));
             }
             (
                 StatusCode::BAD_GATEWAY,
@@ -1572,7 +1580,11 @@ impl<S> ResponsesStreamTransform<S> {
 
     fn flush_log(&mut self, error: Option<String>) {
         if let Some(fields) = self.fields.take() {
-            append_log_line(&stream_log_entry(fields, self.usage.as_ref(), error.clone()));
+            append_log_line(&stream_log_entry(
+                fields,
+                self.usage.as_ref(),
+                error.clone(),
+            ));
         }
         if let Some(spec) = self.raw.take() {
             match self.raw_body.take().map(RawBodyAccumulator::finish) {
@@ -1703,7 +1715,10 @@ async fn handle_responses_with_raw(
             Ok(resp) => resp,
             Err(e) => {
                 if let Some(client) = &raw_client {
-                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(client, &e.to_string()));
+                    crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
+                        client,
+                        &e.to_string(),
+                    ));
                 }
                 (
                     StatusCode::BAD_GATEWAY,
@@ -1967,11 +1982,7 @@ struct StreamTee<S> {
 /// Callback run once when the stream ends: (parsed usage, upstream error,
 /// accumulated raw body — `None` when raw capture is disabled).
 type StreamFinish = Box<
-    dyn FnOnce(
-            Option<crate::usage::UsageSummary>,
-            Option<String>,
-            Option<(Vec<u8>, bool)>,
-        ) + Send,
+    dyn FnOnce(Option<crate::usage::UsageSummary>, Option<String>, Option<(Vec<u8>, bool)>) + Send,
 >;
 
 impl<S, E> futures_util::Stream for StreamTee<S>
@@ -2197,7 +2208,9 @@ fn stream_response(
                 }
                 if let Some(spec) = raw {
                     match raw_body {
-                        Some((body, truncated)) => spec.write_capped(&body, truncated, error.as_deref()),
+                        Some((body, truncated)) => {
+                            spec.write_capped(&body, truncated, error.as_deref())
+                        }
                         None => spec.write_buffered(&[], error.as_deref()),
                     }
                 }
@@ -2604,7 +2617,8 @@ async fn forward_responses_mixed(
                 .await;
                 // Capture the retryable error body raw too (rate-limit details
                 // are usually only visible there).
-                if let Some(spec) = attempt_spec(&raw, name, &url, status, upstream.headers(), false)
+                if let Some(spec) =
+                    attempt_spec(&raw, name, &url, status, upstream.headers(), false)
                 {
                     let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
                     spec.write_buffered(&body_bytes, Some(&format!("HTTP {status}")));
@@ -2832,12 +2846,8 @@ async fn forward_responses_mixed_stream(
                 fields.cost = lookup_model_cost(&profile, &effective);
                 let converter = ChatSseToResponses::new(&effective);
                 let spec = attempt_spec(&raw, name, &url, 200, upstream.headers(), true);
-                let transform = ResponsesStreamTransform::new(
-                    upstream.bytes_stream(),
-                    converter,
-                    fields,
-                    spec,
-                );
+                let transform =
+                    ResponsesStreamTransform::new(upstream.bytes_stream(), converter, fields, spec);
                 return Ok(builder.body(Body::from_stream(transform)).unwrap());
             }
             Ok(upstream) if should_retry(upstream.status().as_u16()) => {
@@ -2860,7 +2870,8 @@ async fn forward_responses_mixed_stream(
                 )
                 .await;
                 // Capture the retryable error body raw too.
-                if let Some(spec) = attempt_spec(&raw, name, &url, status, upstream.headers(), false)
+                if let Some(spec) =
+                    attempt_spec(&raw, name, &url, status, upstream.headers(), false)
                 {
                     let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
                     spec.write_buffered(&body_bytes, Some(&format!("HTTP {status}")));
@@ -3071,14 +3082,9 @@ async fn forward_with_failover(
                             lookup_model_cost(&profile, &effective),
                         )
                         .await;
-                        if let Some(spec) = attempt_spec(
-                            &raw,
-                            name,
-                            &url,
-                            status.as_u16(),
-                            &response_headers,
-                            true,
-                        ) {
+                        if let Some(spec) =
+                            attempt_spec(&raw, name, &url, status.as_u16(), &response_headers, true)
+                        {
                             spec.write_buffered(&body_bytes, None);
                         }
                         return Ok(Json(openai_data).into_response());
@@ -3217,7 +3223,8 @@ async fn forward_with_failover(
                         } else {
                             None
                         };
-                        let spec = attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), true);
+                        let spec =
+                            attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), true);
                         return Ok(stream_response(r, log, spec));
                     } else if should_retry(status.as_u16()) {
                         let status_code = status.as_u16();
@@ -3267,7 +3274,8 @@ async fn forward_with_failover(
                             None,
                         )
                         .await;
-                        let spec = attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), false);
+                        let spec =
+                            attempt_spec(&raw, name, &url, status.as_u16(), r.headers(), false);
                         return Ok(stream_response(r, None, spec));
                     }
                 }
@@ -3662,7 +3670,10 @@ mod tests {
         append_log_line(&fresh);
 
         let text = std::fs::read_to_string(&path).expect("log written");
-        assert!(text.contains("\"fresh-provider\""), "fresh entry must be kept");
+        assert!(
+            text.contains("\"fresh-provider\""),
+            "fresh entry must be kept"
+        );
         assert!(
             !text.contains("\"old-provider\""),
             "entry older than the retention window must be trimmed"
@@ -5986,24 +5997,20 @@ mod tests {
             >,
         >,
         Box<
-            dyn FnOnce(
-                    Option<crate::usage::UsageSummary>,
-                    Option<String>,
-                    Option<(Vec<u8>, bool)>,
-                ) + Send,
+            dyn FnOnce(Option<crate::usage::UsageSummary>, Option<String>, Option<(Vec<u8>, bool)>)
+                + Send,
         >,
     );
+
+    type TeeCallback = Box<
+        dyn FnOnce(Option<crate::usage::UsageSummary>, Option<String>, Option<(Vec<u8>, bool)>)
+            + Send,
+    >;
 
     fn tee_slot() -> TeeSlot {
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle = slot.clone();
-        let cb: Box<
-            dyn FnOnce(
-                    Option<crate::usage::UsageSummary>,
-                    Option<String>,
-                    Option<(Vec<u8>, bool)>,
-                ) + Send,
-        > = Box::new(move |summary, error, raw| {
+        let cb: TeeCallback = Box::new(move |summary, error, raw| {
             *handle.lock().unwrap() = Some((summary, error, raw));
         });
         (slot, cb)
@@ -6155,6 +6162,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std Mutex serializes tests; tokio::test runs on a single-threaded runtime
     async fn raw_log_captures_streamed_request_and_upstream_body() {
         // Serialize with the other raw-log tests (shared state dir file).
         let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
@@ -6238,16 +6246,21 @@ mod tests {
         assert_eq!(entry["requestId"], "req-raw-1");
         assert_eq!(entry["client"]["path"], "/v1/chat/completions");
         assert_eq!(entry["client"]["headers"]["authorization"], "Bearer ***");
-        assert!(entry["client"]["body"].as_str().unwrap().contains("\"model\":\"p1/m1\""));
+        assert!(entry["client"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("\"model\":\"p1/m1\""));
         assert_eq!(entry["attempt"]["provider"], "p1");
         assert_eq!(entry["attempt"]["status"], 200);
         assert_eq!(
-            entry["attempt"]["headers"]["x-upstream-probe"],
-            "yes",
+            entry["attempt"]["headers"]["x-upstream-probe"], "yes",
             "upstream response headers captured"
         );
         assert!(
-            entry["attempt"]["body"].as_str().unwrap().contains("chatcmpl-raw"),
+            entry["attempt"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("chatcmpl-raw"),
             "raw SSE body captured"
         );
         assert_eq!(entry["ok"], true);
@@ -6256,6 +6269,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std Mutex serializes tests; tokio::test runs on a single-threaded runtime
     async fn raw_log_error_entry_when_no_route_and_on_failover_exhaustion() {
         // Serialize with the other raw-log tests (shared state dir file).
         let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
@@ -6288,7 +6302,10 @@ mod tests {
             serde_json::from_str(text.lines().last().expect("one entry")).unwrap();
         assert_eq!(entry["requestId"], "req-raw-2");
         assert!(entry["attempt"].is_null());
-        assert!(entry["error"].as_str().unwrap().contains("No upstream exposes model"));
+        assert!(entry["error"]
+            .as_str()
+            .unwrap()
+            .contains("No upstream exposes model"));
         assert_eq!(entry["ok"], false);
     }
 
@@ -6633,8 +6650,7 @@ mod tests {
         let sent: serde_json::Value =
             serde_json::from_str(seen.lock().unwrap().as_ref().expect("body captured")).unwrap();
         assert_eq!(
-            sent["model"],
-            "deepseek-v4-flash",
+            sent["model"], "deepseek-v4-flash",
             "namespaced model must be rewritten before reaching opencode upstream"
         );
         assert_eq!(sent["messages"][0]["role"], "system");

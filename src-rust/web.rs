@@ -298,7 +298,9 @@ async fn get_rawlogs(Query(q): Query<HashMap<String, String>>) -> ApiJson {
         .clamp(1, 200);
     let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
     let entries = crate::rawlog::list(limit, offset);
-    Ok(Json(json!({ "total": crate::rawlog::count(), "entries": entries })))
+    Ok(Json(
+        json!({ "total": crate::rawlog::count(), "entries": entries }),
+    ))
 }
 
 /// One full raw-log entry (with raw bodies) by id.
@@ -820,6 +822,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std Mutex serializes tests; tokio::test runs on a single-threaded runtime
     async fn rawlogs_list_detail_and_clear_roundtrip() {
         // Serialize with the other raw-log tests (shared state dir file).
         let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
@@ -866,7 +869,9 @@ mod tests {
         let list = get("/api/rawlogs?limit=10").await;
         assert_eq!(list.status(), StatusCode::OK);
         let list_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(list.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(list_body["total"], 1);
@@ -882,10 +887,15 @@ mod tests {
         let detail = get(&format!("/api/rawlogs/{id}")).await;
         assert_eq!(detail.status(), StatusCode::OK);
         let detail_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(detail.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(detail.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap();
-        assert!(detail_body["client"]["body"].is_string(), "detail keeps bodies");
+        assert!(
+            detail_body["client"]["body"].is_string(),
+            "detail keeps bodies"
+        );
         assert!(detail_body["attempt"]["body"].is_string());
 
         let missing = get("/api/rawlogs/does-not-exist").await;
@@ -904,7 +914,9 @@ mod tests {
         assert_eq!(cleared.status(), StatusCode::OK);
         let after = get("/api/rawlogs").await;
         let after_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(after.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(after.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(after_body["total"], 0);
