@@ -149,9 +149,7 @@ pub fn node_unserviceable(
     }
     // Only rule chains carry a model scope; legacy chains and standalone
     // profiles are judged on circuit state alone.
-    let Some(rule_match) = rule_match else {
-        return None;
-    };
+    let rule_match = rule_match?;
     if rule_match.is_empty() {
         // An empty match never routes anything (RuleMatch::matches is false),
         // so the chain is never used; treat it as healthy, not broken.
