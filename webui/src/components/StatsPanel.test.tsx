@@ -35,6 +35,15 @@ function reqPage(requests: RecentRequest[] = []): ConversationRequestsPage {
   return { requests, total: requests.length };
 }
 
+/**
+ * The stats-window preset button. The conversation card renders its own
+ * preset row with identical labels (Today/24h/7d/Custom) because it is
+ * expanded by default, so the stats card's button is always the first match.
+ */
+function mainPreset(name: string) {
+  return screen.getAllByRole("button", { name })[0];
+}
+
 
 function fullStats(): UsageStats {
   return {
@@ -206,7 +215,6 @@ describe("StatsPanel", () => {
     expect(screen.getAllByText("350.0K").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("13.5K").length).toBeGreaterThanOrEqual(1);
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const table = await screen.findByRole("table", { name: "By conversation" });
     expect(within(table).getByText("conv-a1b2c3d…")).toBeInTheDocument();
     expect(within(table).getByText("unlabeled")).toBeInTheDocument();
@@ -292,7 +300,6 @@ describe("StatsPanel", () => {
     expect(screen.getAllByText("-").length).toBeGreaterThanOrEqual(3);
     expect(screen.getAllByText("4").length).toBeGreaterThanOrEqual(1);
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     expect(await screen.findByText("No conversation data in this range.")).toBeInTheDocument();
   });
 
@@ -361,7 +368,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
 
     await screen.findByText("363.5K");
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const convTable = await screen.findByRole("table", { name: "By conversation" });
     const convRows = within(convTable).getAllByRole("row");
     expect(within(convRows[1]).getByText("$0.75")).toBeInTheDocument();
@@ -369,8 +375,8 @@ describe("StatsPanel", () => {
 
     const rows = within(screen.getByRole("table", { name: "Request details" })).getAllByRole("row");
     expect(within(rows[1]).getByText("$0.75")).toBeInTheDocument();
-    // 7 token columns + Session column render "-" for the bare row.
-    expect(within(rows[2]).getAllByText("-").length).toBe(8);
+    // 7 token columns + Total + Session column render "-" for the bare row.
+    expect(within(rows[2]).getAllByText("-").length).toBe(9);
   });
 
   it("tolerates an old backend that omits the token fields", async () => {
@@ -399,7 +405,6 @@ describe("StatsPanel", () => {
 
     expect((await screen.findAllByText("2")).length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByText("-").length).toBeGreaterThanOrEqual(2);
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     expect(await screen.findByText("No conversation data in this range.")).toBeInTheDocument();
   });
 
@@ -427,7 +432,6 @@ describe("StatsPanel", () => {
     );
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const table = await screen.findByRole("table", { name: "By conversation" });
 
     expect(within(table).getByText("200.0K")).toBeInTheDocument();
@@ -471,7 +475,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
 
     expect((await screen.findAllByText("1.5K")).length).toBeGreaterThanOrEqual(1);
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const table = await screen.findByRole("table", { name: "By conversation" });
     expect(within(table).getByText("conv-old")).toBeInTheDocument();
     expect(within(table).getByText("1.0K")).toBeInTheDocument();
@@ -586,9 +589,9 @@ describe("StatsPanel", () => {
     const rows = within(screen.getByRole("table", { name: "Request details" })).getAllByRole("row");
     expect(within(rows[1]).getByText("200")).toBeInTheDocument();
     expect(within(rows[1]).getByText("72.1%")).toBeInTheDocument();
-    // 7 token columns + Session column render "-" for rows without an id.
-    expect(within(rows[2]).getAllByText("-").length).toBe(8);
-    expect(within(rows[3]).getAllByText("-").length).toBe(8);
+    // 7 token columns + Total + Session column render "-" for rows without an id.
+    expect(within(rows[2]).getAllByText("-").length).toBe(9);
+    expect(within(rows[3]).getAllByText("-").length).toBe(9);
   });
 
   it("does not render the request details card when recentRequests is empty or absent", async () => {
@@ -657,12 +660,19 @@ describe("StatsPanel", () => {
     expect(screen.getByRole("table", { name: "Request details" })).toBeInTheDocument();
   });
 
-  it("collapses conversations by default and toggles on header click", async () => {
+  it("expands conversations by default and toggles on header click", async () => {
     statsMock.mockResolvedValue(fullStats());
     convMock.mockResolvedValue(convPage([{ conversationId: "unlabeled", requests: 3, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 }]));
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
+    expect(screen.getByRole("table", { name: "By conversation" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /By conversation/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     expect(screen.queryByRole("table", { name: "By conversation" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /By conversation/ })).toHaveAttribute(
       "aria-expanded",
@@ -671,13 +681,6 @@ describe("StatsPanel", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     expect(await screen.findByRole("table", { name: "By conversation" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /By conversation/ })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
-    expect(screen.queryByRole("table", { name: "By conversation" })).not.toBeInTheDocument();
   });
 
   it("shows the conversation name and falls back to the truncated id", async () => {
@@ -707,7 +710,6 @@ describe("StatsPanel", () => {
     );
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const table = await screen.findByRole("table", { name: "By conversation" });
 
     expect(within(table).getByText("My chat")).toBeInTheDocument();
@@ -722,13 +724,13 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
 
     expect(await screen.findByText("363.5K")).toBeInTheDocument();
-    const today = screen.getByRole("button", { name: "Today" });
+    const today = mainPreset("Today");
     expect(today).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "24h" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "7d" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Custom" })).toBeInTheDocument();
+    expect(mainPreset("24h")).toBeInTheDocument();
+    expect(mainPreset("7d")).toBeInTheDocument();
+    expect(mainPreset("Custom")).toBeInTheDocument();
     expect(today).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "24h" })).toHaveAttribute("aria-pressed", "false");
+    expect(mainPreset("24h")).toHaveAttribute("aria-pressed", "false");
   });
 
   it("reveals the custom date inputs only in custom mode", async () => {
@@ -738,12 +740,12 @@ describe("StatsPanel", () => {
     await screen.findByText("363.5K");
     expect(screen.queryByLabelText("From")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
     expect(screen.getByLabelText("From")).toBeInTheDocument();
     expect(screen.getByLabelText("To")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Custom" })).toHaveAttribute("aria-pressed", "true");
+    expect(mainPreset("Custom")).toHaveAttribute("aria-pressed", "true");
 
-    fireEvent.click(screen.getByRole("button", { name: "Today" }));
+    fireEvent.click(mainPreset("Today"));
     expect(screen.queryByLabelText("From")).not.toBeInTheDocument();
   });
 
@@ -761,7 +763,7 @@ describe("StatsPanel", () => {
       50,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "24h" }));
+    fireEvent.click(mainPreset("24h"));
     await waitFor(() =>
       expect(statsMock).toHaveBeenLastCalledWith(
         "last24h",
@@ -772,7 +774,7 @@ describe("StatsPanel", () => {
       ),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "7d" }));
+    fireEvent.click(mainPreset("7d"));
     await waitFor(() =>
       expect(statsMock).toHaveBeenLastCalledWith(
         "last7d",
@@ -790,7 +792,7 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
     await waitFor(() =>
       expect(statsMock).toHaveBeenLastCalledWith(
         "custom",
@@ -834,7 +836,7 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: "24h" }));
+    fireEvent.click(mainPreset("24h"));
     expect(await screen.findByText("3")).toBeInTheDocument();
   });
 
@@ -844,7 +846,7 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
     await waitFor(() => expect(statsMock).toHaveBeenCalledTimes(2));
     statsMock.mockClear();
 
@@ -877,7 +879,7 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
     await waitFor(() => expect(statsMock).toHaveBeenCalledTimes(2));
     statsMock.mockClear();
 
@@ -891,9 +893,9 @@ describe("StatsPanel", () => {
       expect(screen.getByText("End must be on or after start")).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Today" }));
+    fireEvent.click(mainPreset("Today"));
     statsMock.mockClear();
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
 
     expect(screen.getByText("End must be on or after start")).toBeInTheDocument();
     expect(statsMock).not.toHaveBeenCalled();
@@ -905,7 +907,7 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
     await waitFor(() => expect(statsMock).toHaveBeenCalledTimes(2));
     statsMock.mockClear();
 
@@ -1133,7 +1135,7 @@ describe("StatsPanel", () => {
     expect(await screen.findByText("b-0")).toBeInTheDocument();
     expect(statsMock).toHaveBeenLastCalledWith("today", expect.any(Number), expect.any(Number), 2, 50);
 
-    fireEvent.click(screen.getByRole("button", { name: "24h" }));
+    fireEvent.click(mainPreset("24h"));
     await waitFor(() =>
       expect(statsMock).toHaveBeenLastCalledWith(
         "last24h",
@@ -1145,7 +1147,7 @@ describe("StatsPanel", () => {
     );
     expect(await screen.findByText("c-0")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    fireEvent.click(mainPreset("Custom"));
     await waitFor(() =>
       expect(statsMock).toHaveBeenLastCalledWith(
         "custom",
@@ -1242,7 +1244,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     expect(await screen.findByText("No conversation data in this range.")).toBeInTheDocument();
     expect(screen.queryByRole("table", { name: "By conversation" })).not.toBeInTheDocument();
   });
@@ -1254,7 +1255,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     await screen.findByRole("table", { name: "By conversation" });
     convMock.mockClear();
 
@@ -1288,7 +1288,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     await screen.findByRole("table", { name: "By conversation" });
     convMock.mockClear();
 
@@ -1314,7 +1313,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const table = await screen.findByRole("table", { name: "By conversation" });
     expect(within(table).getByText("conv-0")).toBeInTheDocument();
     expect(screen.getByText("120 rows")).toBeInTheDocument();
@@ -1334,7 +1332,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     await screen.findByRole("table", { name: "By conversation" });
     convMock.mockClear();
 
@@ -1437,7 +1434,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const table = await screen.findByRole("table", { name: "By conversation" });
     fireEvent.click(screen.getByRole("button", { name: /Expand conversation conv-a/ }));
     expect(convReqMock).toHaveBeenCalledWith("conv-a", 0, 50);
@@ -1475,7 +1471,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     await screen.findByRole("table", { name: "By conversation" });
 
     fireEvent.click(screen.getByRole("button", { name: /Expand conversation conv-a/ }));
@@ -1503,7 +1498,6 @@ describe("StatsPanel", () => {
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("363.5K");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     await screen.findByRole("table", { name: "By conversation" });
     fireEvent.click(screen.getByRole("button", { name: /Expand conversation conv-a/ }));
 
@@ -1560,7 +1554,6 @@ describe("StatsPanel", () => {
     const highRow = within(reqTable).getByText("90.0%");
     expect(highRow.className).not.toContain("text-red-300");
 
-    fireEvent.click(screen.getByRole("button", { name: /By conversation/ }));
     const convTable = await screen.findByRole("table", { name: "By conversation" });
     expect(within(convTable).getByText("30.0%").className).toContain("text-red-300");
     expect(within(convTable).getByText("90.0%").className).not.toContain("text-red-300");
@@ -1593,7 +1586,7 @@ describe("StatsPanel", () => {
     convMock.mockResolvedValue(convPage([]));
     render(<StatsPanel state={{} as never} refresh={async () => {}} />);
     await screen.findByText("Request details");
-    fireEvent.click(screen.getByRole("button", { name: /Copy conversation conv-abc-123/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Copy conversation my chat/ }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("conv-abc-123"));
   });
 });

@@ -906,11 +906,12 @@ function CopyableSessionCell({
   className?: string;
 }) {
   const [copied, setCopied] = useState(false);
-  const display = decodeConversationName(name ?? "") || (id ? shortConversationId(id) : "-");
+  const name_ = decodeConversationName(name ?? "");
+  const display = name_ || (id ? shortConversationId(id) : "-");
   return (
     <button
       type="button"
-      title={display === "-" ? undefined : display}
+      title={name_ || id || undefined}
       aria-label={id ? `Copy conversation ${display}` : undefined}
       onClick={() => {
         if (!id) return;
