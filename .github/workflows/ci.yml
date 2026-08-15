@@ -84,31 +84,97 @@ jobs:
       - name: Test Rust
         run: cargo test --release --lib
 
-  build:
+  # macOS：默认总是构建（日常 PR / 手动触发的主要目标）
+  build-macos:
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macOS：默认总是构建（日常 PR / 手动触发的主要目标）
           - target: x86_64-apple-darwin
             os: macos-latest
+            use_zig: false
           - target: aarch64-apple-darwin
             os: macos-latest
-          # 非 macOS 平台：仅在发布（v* tag）或手动勾选 all-platforms 时构建
+            use_zig: false
+
+    runs-on: ${{ matrix.os }}
+    name: build / ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux musl only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install zig (for glibc 2.31 targeting)
+        if: matrix.use_zig == true
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.11.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zig == true
+        run: pip3 install cargo-zigbuild
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build WebUI
+        run: npm run build:webui
+
+      - name: Build native (with zig for glibc 2.31)
+        if: matrix.use_zig == true
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
+          cp target/x86_64-unknown-linux-gnu/release/libpi_switch_native.so pi-switch-native.linux-x64-gnu.node
+
+      - name: Build native (standard)
+        if: matrix.use_zig != true
+        run: |
+          npm install -g @napi-rs/cli
+          npm run build:native -- --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: "*.node"
+          if-no-files-found: error
+
+  # 非 macOS 平台：仅在发布（v* tag，npm 包需全平台二进制）或手动勾选
+  # all-platforms 时构建；日常 PR / 默认手动触发只构建 macOS。
+  build-extra:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.all-platforms == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_zig: true
-            extra: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            extra: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            extra: true
-
-    # 默认只构建 macOS；发布（v* tag，npm 包需要全平台二进制）或
-    # workflow_dispatch 勾选 all-platforms 时才构建全平台。
-    if: ${{ !matrix.extra || startsWith(github.ref, 'refs/tags/v') || github.event.inputs.all-platforms == 'true' }}
 
     runs-on: ${{ matrix.os }}
     name: build / ${{ matrix.target }}
@@ -174,7 +240,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [build-macos, build-extra]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
