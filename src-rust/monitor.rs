@@ -109,9 +109,8 @@ pub fn build_probe(profile: &Value, probe_path: &str) -> (String, HeaderMap) {
         .unwrap_or("")
         .trim_end_matches('/')
         .to_string();
-    let api_key = crate::config::resolve_env(
-        profile.get("apiKey").and_then(Value::as_str).unwrap_or(""),
-    );
+    let api_key =
+        crate::config::resolve_env(profile.get("apiKey").and_then(Value::as_str).unwrap_or(""));
     let api = profile.get("api").and_then(Value::as_str).unwrap_or("");
     let is_anthropic = api.to_lowercase().contains("anthropic");
 
@@ -381,7 +380,12 @@ mod tests {
         );
         assert_eq!(extract_chains(&config), vec![vec!["a", "b"]]);
 
-        let empties = config_with(vec![(vec![], vec![]), (vec![], vec!["  "])], None, None, vec![]);
+        let empties = config_with(
+            vec![(vec![], vec![]), (vec![], vec!["  "])],
+            None,
+            None,
+            vec![],
+        );
         assert!(extract_chains(&empties).is_empty());
     }
 
@@ -396,10 +400,7 @@ mod tests {
                 ("yiapi", profile(&["gpt-y"])),
             ],
         );
-        assert_eq!(
-            extract_chains(&config),
-            vec![vec!["congee"], vec!["yiapi"]]
-        );
+        assert_eq!(extract_chains(&config), vec![vec!["congee"], vec!["yiapi"]]);
     }
 
     #[test]
@@ -421,7 +422,11 @@ mod tests {
             vec![(vec![], vec!["a", "b"])],
             None,
             None,
-            vec![("a", profile(&["m"])), ("b", profile(&["m"])), ("c", profile(&["m"]))],
+            vec![
+                ("a", profile(&["m"])),
+                ("b", profile(&["m"])),
+                ("c", profile(&["m"])),
+            ],
         );
         assert_eq!(extract_chains(&config), vec![vec!["a", "b"], vec!["c"]]);
     }
@@ -443,7 +448,11 @@ mod tests {
             vec![(vec![], vec!["a", "b"]), (vec![], vec!["c"])],
             None,
             None,
-            vec![("a", profile(&["m"])), ("b", profile(&["m"])), ("c", profile(&["m"]))],
+            vec![
+                ("a", profile(&["m"])),
+                ("b", profile(&["m"])),
+                ("c", profile(&["m"])),
+            ],
         );
         let mut circuit = CircuitStateStore::default();
         circuit.providers.insert(
@@ -493,7 +502,10 @@ mod tests {
         p["apiKey"] = json!("sk-ant-1");
         let (url, headers) = build_probe(&p, "models");
         assert_eq!(url, "https://up.example.com/v1/models");
-        assert_eq!(headers.get("x-api-key").unwrap().to_str().unwrap(), "sk-ant-1");
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "sk-ant-1"
+        );
         assert_eq!(
             headers.get("anthropic-version").unwrap().to_str().unwrap(),
             "2023-06-01"
@@ -508,7 +520,10 @@ mod tests {
         p["headers"] = json!({ "X-Custom": "yes", "x-extra": "${WATCHDOG_TEST_KEY}" });
         let (_url, headers) = build_probe(&p, "/models");
         assert_eq!(headers.get("x-custom").unwrap().to_str().unwrap(), "yes");
-        assert_eq!(headers.get("x-extra").unwrap().to_str().unwrap(), "secret-1");
+        assert_eq!(
+            headers.get("x-extra").unwrap().to_str().unwrap(),
+            "secret-1"
+        );
     }
 
     #[test]
@@ -518,7 +533,11 @@ mod tests {
         let path = dir.join("recovery.jsonl");
         let _ = std::fs::remove_file(&path);
         // 生产代码的 recovery_log_path 使用同一 state_dir (测试重定向)
-        append_recovery_event("up-a", &["up-a", "up-b"].map(String::from), &["sess-1", "sess-2"].map(String::from));
+        append_recovery_event(
+            "up-a",
+            &["up-a", "up-b"].map(String::from),
+            &["sess-1", "sess-2"].map(String::from),
+        );
         append_recovery_event("up-c", &["up-c"].map(String::from), &[]);
 
         let text = std::fs::read_to_string(&path).expect("recovery log written");

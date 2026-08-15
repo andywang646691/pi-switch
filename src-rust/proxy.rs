@@ -301,6 +301,9 @@ fn is_circuit_open(
 /// reads the file, mutates the in-memory copy and rewrites it wholesale.
 static CIRCUIT_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+// tokio::sync::Mutex 的 guard 跨 await 是设计内的用法 (不阻塞线程),
+// clippy::await_holding_lock 是针对 std 同步锁的 lint, 此处为误报。
+#[allow(clippy::await_holding_lock)]
 async fn record_success(name: &str, half_open: bool) {
     let _guard = CIRCUIT_STATE_LOCK.lock().await;
     let mut state = read_circuit_state().await;
@@ -337,6 +340,7 @@ async fn record_success(name: &str, half_open: bool) {
 /// ids whose requests failed during the outage. The caller emits a recovery
 /// event only when `was_open`; the affected list lets each pi session decide
 /// whether the event concerns it (see failover-watchdog extension).
+#[allow(clippy::await_holding_lock)]
 pub(crate) async fn clear_circuit(name: &str) -> (bool, Vec<String>) {
     let _guard = CIRCUIT_STATE_LOCK.lock().await;
     let mut state = read_circuit_state().await;
@@ -366,19 +370,26 @@ fn register_affected_conversation(entry: &mut CircuitEntry, conversation_id: Opt
     if conversation_id.trim().is_empty() {
         return;
     }
-    if entry.affected_conversations.iter().any(|c| c == conversation_id) {
+    if entry
+        .affected_conversations
+        .iter()
+        .any(|c| c == conversation_id)
+    {
         return;
     }
     if entry.affected_conversations.len() >= AFFECTED_CONVERSATIONS_CAP {
         entry.affected_conversations.remove(0);
     }
-    entry.affected_conversations.push(conversation_id.to_string());
+    entry
+        .affected_conversations
+        .push(conversation_id.to_string());
 }
 
 /// Register a conversation whose request was rejected because the provider's
 /// circuit was open. The outage may have been caused by another client — but
 /// this request did fail (circuit_open skip), so on recovery the session is
 /// notified and can retry.
+#[allow(clippy::await_holding_lock)]
 async fn note_affected(name: &str, conversation_id: Option<&str>) {
     let Some(conversation_id) = conversation_id else {
         return;
@@ -395,6 +406,7 @@ async fn note_affected(name: &str, conversation_id: Option<&str>) {
     write_circuit_state(&state).await;
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn record_failure(
     name: &str,
     settings: &CircuitBreakerSettings,
@@ -2720,8 +2732,14 @@ async fn forward_responses_mixed(
             }
             Err(error) => {
                 let message = error.to_string();
-                record_failure(name, circuit_settings, &message, is_half_open, conversation_id)
-                    .await;
+                record_failure(
+                    name,
+                    circuit_settings,
+                    &message,
+                    is_half_open,
+                    conversation_id,
+                )
+                .await;
                 log_failed_attempt(
                     name,
                     Some(&message),
@@ -2976,8 +2994,14 @@ async fn forward_responses_mixed_stream(
             }
             Err(error) => {
                 let message = error.to_string();
-                record_failure(name, circuit_settings, &message, is_half_open, conversation_id)
-                    .await;
+                record_failure(
+                    name,
+                    circuit_settings,
+                    &message,
+                    is_half_open,
+                    conversation_id,
+                )
+                .await;
                 log_failed_attempt(
                     name,
                     Some(&message),
@@ -3537,8 +3561,14 @@ async fn forward_anthropic_with_failover(
                 continue;
             }
             Err(e) => {
-                record_failure(name, circuit_settings, &e.to_string(), is_half_open, conversation_id)
-                    .await;
+                record_failure(
+                    name,
+                    circuit_settings,
+                    &e.to_string(),
+                    is_half_open,
+                    conversation_id,
+                )
+                .await;
                 if let Some(client) = &raw {
                     crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
                         client,
@@ -3840,7 +3870,12 @@ mod tests {
         assert!(!was_open);
         assert!(affected.is_empty());
         let state = super::read_circuit_state().await;
-        assert!(state.providers.get("up-a").unwrap().affected_conversations.is_empty());
+        assert!(state
+            .providers
+            .get("up-a")
+            .unwrap()
+            .affected_conversations
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3878,8 +3913,14 @@ mod tests {
             cooldown_seconds: 60,
         };
         for i in 0..(super::AFFECTED_CONVERSATIONS_CAP + 5) {
-            super::record_failure("up-d", &settings, "HTTP 503", false, Some(&format!("sess-{i}")))
-                .await;
+            super::record_failure(
+                "up-d",
+                &settings,
+                "HTTP 503",
+                false,
+                Some(&format!("sess-{i}")),
+            )
+            .await;
         }
         let state = super::read_circuit_state().await;
         let affected = &state.providers.get("up-d").unwrap().affected_conversations;
@@ -5360,6 +5401,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // 测试专用: 短暂持有 std Mutex 跨 oneshot await, 只用于与 rawlog 测试
+    // 串行; 多线程 runtime 下不会阻塞其他测试线程。
+    #[allow(clippy::await_holding_lock)]
     async fn accepts_model_requests_larger_than_axum_default_body_limit() {
         // 该请求会走到 no-route 错误路径, 处理器会向 raw log 追加一条记录;
         // 与其他 raw-log 写入测试一样持锁, 避免与 rawlog 计数测试竞态。
