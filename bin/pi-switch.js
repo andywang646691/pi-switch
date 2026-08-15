@@ -791,8 +791,17 @@ async function main() {
         } else {
           // Foreground mode: run server directly
           console.log(`Starting proxy server on http://${host}:${port} (foreground mode)`);
-          console.log(`Note: Ctrl+C may not work reliably on Windows. Recommend using --daemon flag.`);
-          console.log(`To stop: Find PID with 'netstat -ano | findstr :${port}', then 'taskkill /F /PID <pid>'`);
+          console.log(`PID: ${process.pid}`);
+
+          // 关键：先注册空信号处理器，替换 Node 默认的 SignalExit 路径。
+          // Node 默认为 SIGTERM/SIGINT 预装了 SignalExit → ResetStdio 处理器；
+          // Rust 侧 tokio::signal 注册时（signal-hook）会链式调用这个旧处理器，
+          // 在异常/挂起的终端上 tcsetattr 死循环 → 进程退不掉、CPU 飙高（历史事故）。
+          // 这里用空回调替换默认处理器后，链式调用的是无害回调，
+          // 信号仍由 Rust 侧 shutdown_signal 消费并优雅关闭（见 lib.rs）。
+          for (const sig of ["SIGTERM", "SIGHUP", "SIGINT"]) {
+            process.on(sig, () => {});
+          }
 
           await runProxyServer(host, port);
         }

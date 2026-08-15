@@ -54,6 +54,35 @@ on:
 
 **规则：每次功能完成后，必须检查并完成打 tag 发布，否则 CI 不构建、npm 不更新。** WebUI 改动只有发布新版本用户才能看到——因为 WebUI 是编译期嵌入二进制的。
 
+### CI 构建范围（2026-08-15 调整）
+
+`.github/workflows/ci.yml` 默认**只构建 macOS 两个平台**（x86_64 / aarch64）：
+- `pull_request` / 手动触发（未勾选）→ 只 macOS
+- `workflow_dispatch` 勾选 `all-platforms` → 全平台
+- **发布（v* tag）→ 始终全平台**（npm 包需要全部 `.node` 二进制，缺了其他平台用户装不上）
+
+## 信号处理与进程管理（前台卡死事故修复，2026-08-15）
+
+### 事故根因（双层）
+
+前台模式进程（有 TTY）收到 SIGTERM/SIGINT 时：
+1. Node 默认为这两个信号预装 `SignalExit → ResetStdio → tcsetattr` 处理器，在异常/挂起的终端上死循环，进程退不掉
+2. Rust 侧 `tokio::signal` 注册时（signal-hook）会**链式调用**已安装的旧处理器——即使 Rust 侧消费了信号，Node 的 SignalExit 仍会被链式触发并卡死
+
+（SIGHUP 无 Node 默认处理器，SIG_DFL 不被链式调用，所以只挂 TERM/INT）
+
+### 修复机制
+
+- `bin/pi-switch.js` 前台分支：调用 `runProxyServer` 前先注册**空信号处理器**（SIGTERM/SIGHUP/SIGINT），替换 Node 默认 SignalExit；链式调用时执行的是无害空回调
+- `src-rust/lib.rs` `shutdown_signal()`：Rust 侧消费 SIGINT/SIGTERM/SIGHUP → axum graceful shutdown → napi Promise resolve → Node await 返回 → 进程退出（tokio 线程随进程终止）；另加 5s watchdog 强退兜底
+- `src-rust/daemon.rs`：`daemon_stop` 无 pid 文件但端口被 pi-switch 进程占用时，按端口反查（lsof/netstat）并校验命令行含 `pi-switch` 后终止——清理失控前台实例；`daemon_status` 同步提示端口占用
+
+### 注意
+
+- daemon 子进程与前台模式走**同一代码路径**（`daemon_start` spawn 不带 `--daemon` 的子进程），修复对两种模式统一生效
+- 前台模式不写 pid 文件（避免与 daemon pid 文件冲突），失控清理靠 `proxy stop` 的端口兜底
+- Windows：`process.on('SIGTERM')` 无效但无害；Rust 侧 `not(unix)` 分支保持 ctrl_c + watchdog
+
 ## 测试
 
 ```bash

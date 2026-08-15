@@ -208,6 +208,77 @@ fn force_kill(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ─── 端口反查辅助（兜底清理失控进程）──────────────────────
+// 前台模式（有 TTY 的实例）不在 pid 文件管理范围内；失控遗留时 pid 文件
+// 可能缺失。stop/status 时按配置端口反查监听进程，校验命令行含 pi-switch
+// 后才终止，避免误杀其他占用同一端口的程序。
+
+#[cfg(unix)]
+fn find_listeners(port: u16) -> Vec<u32> {
+    // lsof 在 macOS / Linux 上都有；-t 只输出 PID，-sTCP:LISTEN 只匹配监听态。
+    let output = Command::new("lsof")
+        .arg("-t")
+        .arg(format!("-iTCP:{}", port))
+        .arg("-sTCP:LISTEN")
+        .output();
+    let Ok(out) = output else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
+}
+
+#[cfg(windows)]
+fn find_listeners(port: u16) -> Vec<u32> {
+    // netstat -ano 输出形如: TCP 0.0.0.0:43112 ... LISTENING 1234
+    let output = Command::new("netstat").arg("-ano").output();
+    let Ok(out) = output else { return Vec::new() };
+    let port_str = format!(":{}", port);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(&port_str) && l.contains("LISTENING"))
+        .filter_map(|l| {
+            l.rsplit(' ')
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        })
+        .collect()
+}
+
+/// 进程命令行是否包含 pi-switch（防误杀其他占用端口的进程）。
+#[cfg(unix)]
+fn is_pi_switch_process(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("pi-switch"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn is_pi_switch_process(pid: u32) -> bool {
+    // wmic 取命令行，校验包含 pi-switch 防误杀。
+    let output = Command::new("wmic")
+        .args([
+            "process",
+            "where",
+            &format!("ProcessId={}", pid),
+            "get",
+            "CommandLine",
+            "/value",
+        ])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("pi-switch"),
+        Err(_) => false,
+    }
+}
+
 // ─── PID file I/O ─────────────────────────────────────────
 
 fn read_pid_file(service: &Service) -> Option<DaemonInfo> {
@@ -373,6 +444,52 @@ pub fn daemon_stop(service: &Service) -> Result<DaemonResult, String> {
     let info = match read_pid_file(service) {
         Some(i) => i,
         None => {
+            // 无 pid 文件但端口仍被监听：可能是失控的前台实例（有 TTY 的前台
+            // 进程不在 pid 文件管理范围）。按配置端口兑底反查并清理，避免遗留
+            // 进程继续占用端口/烧 CPU。校验命令行含 pi-switch 后才会终止。
+            let (host, port) = service_defaults(service);
+            if check_health(&host, port, 1) {
+                let pids: Vec<u32> = find_listeners(port)
+                    .into_iter()
+                    .filter(|pid| is_pi_switch_process(*pid))
+                    .collect();
+                if !pids.is_empty() {
+                    let pid_list = pids
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let msg = format!(
+                        "No {} PID file found, but port {}:{} is held by pi-switch PID(s) {} — stopping",
+                        service.label, host, port, pid_list
+                    );
+                    // 先优雅终止，最多等 2 秒，未退则强杀。
+                    for pid in &pids {
+                        kill_process(*pid);
+                    }
+                    for _ in 0..20 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if !pids.iter().any(|p| is_alive(*p)) {
+                            break;
+                        }
+                    }
+                    for pid in &pids {
+                        if is_alive(*pid) {
+                            force_kill(*pid);
+                        }
+                    }
+                    return Ok(DaemonResult {
+                        running: false,
+                        pid: pids.first().copied(),
+                        host: Some(host),
+                        port: Some(port),
+                        targets: None,
+                        rules: None,
+                        started_at: None,
+                        message: msg,
+                    });
+                }
+            }
             return Ok(DaemonResult {
                 running: false,
                 pid: None,
@@ -441,6 +558,16 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
     let info = match read_pid_file(service) {
         Some(i) => i,
         None => {
+            // 无 pid 文件：检查端口是否被不受管进程占用，给出明确提示。
+            let (host, port) = service_defaults(service);
+            let extra = if check_health(&host, port, 1) {
+                format!(
+                    " (port {}:{} is in use by an unmanaged process)",
+                    host, port
+                )
+            } else {
+                String::new()
+            };
             return Ok(DaemonResult {
                 running: false,
                 pid: None,
@@ -449,7 +576,10 @@ pub fn daemon_status(service: &Service) -> Result<DaemonResult, String> {
                 targets: None,
                 rules: None,
                 started_at: None,
-                message: format!("{} daemon is not running (no PID file)", service.label),
+                message: format!(
+                    "{} daemon is not running (no PID file){}",
+                    service.label, extra
+                ),
             });
         }
     };

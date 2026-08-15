@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      all-platforms:
+        description: "构建全平台（默认仅 macOS）"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -83,17 +89,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS：默认总是构建（日常 PR / 手动触发的主要目标）
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          # 非 macOS 平台：仅在发布（v* tag）或手动勾选 all-platforms 时构建
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_zig: true
+            extra: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            extra: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            extra: true
+
+    # 默认只构建 macOS；发布（v* tag，npm 包需要全平台二进制）或
+    # workflow_dispatch 勾选 all-platforms 时才构建全平台。
+    if: ${{ !matrix.extra || startsWith(github.ref, 'refs/tags/v') || github.event.inputs.all-platforms == 'true' }}
 
     runs-on: ${{ matrix.os }}
     name: build / ${{ matrix.target }}

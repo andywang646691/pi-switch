@@ -267,6 +267,51 @@ pub fn run_native_tui() -> napi::Result<()> {
 
 // ─── Proxy Server ─────────────────────────────────────────
 
+/// 优雅关闭信号：在 Rust 侧消费 SIGINT/SIGTERM/SIGHUP。
+///
+/// 前台模式与 daemon 子进程走同一代码路径（bin/pi-switch.js 前台分支）。
+/// 若信号交给 Node 默认处理，会触发 SignalExit → ResetStdio → tcsetattr，
+/// 在异常/挂起的终端上死循环——有 TTY 的前台进程收 SIGTERM/SIGHUP 后
+/// 退不掉、CPU 飙高（历史事故根因）。这里由 tokio 消费信号后，Node 收不到
+/// 信号、不会走默认退出路径；优雅关闭完成后 napi Promise resolve，Node 侧
+/// await 返回、进程退出，napi 的 tokio 线程随进程终止。
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // 注意：SIGINT 用 ctrl_c()（unix 下即 SIGINT），与 SIGTERM/SIGHUP 的
+    // unix::signal 互不冲突；不能重复注册 interrupt()，否则会 panic。
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => eprintln!("\nReceived Ctrl+C (SIGINT), shutting down gracefully..."),
+        _ = sigterm.recv() => eprintln!("\nReceived SIGTERM, shutting down gracefully..."),
+        _ = sighup.recv() => eprintln!("\nReceived SIGHUP, shutting down gracefully..."),
+    }
+
+    spawn_shutdown_watchdog();
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl+C handler");
+    eprintln!("\nReceived Ctrl+C, shutting down gracefully...");
+    spawn_shutdown_watchdog();
+}
+
+/// 超时强退兜底：收到信号后 5 秒内未退出（慢连接挂起等）则硬退进程，
+/// 保证进程一定能退出（防止卡死事故复发）。
+fn spawn_shutdown_watchdog() {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        eprintln!("\nGraceful shutdown timed out after 5s, forcing exit...");
+        std::process::exit(1);
+    });
+}
+
 #[napi]
 pub async fn run_proxy_server(host: String, port: u16) -> napi::Result<()> {
     use std::sync::Arc;
@@ -294,16 +339,10 @@ pub async fn run_proxy_server(host: String, port: u16) -> napi::Result<()> {
 
     eprintln!("Proxy server listening on http://{}", addr);
 
-    // Enable graceful shutdown on Ctrl+C
-    let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-        eprintln!("\nReceived Ctrl+C, shutting down gracefully...");
-    };
-
+    // 优雅关闭：Rust 侧消费 SIGINT/SIGTERM/SIGHUP（见 shutdown_signal 注释），
+    // 避免 Node 默认信号退出在异常终端上卡死；收到信号后 5 秒未退完则硬退。
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
+        .with_graceful_shutdown(shutdown_signal())
         .await;
 
     match result {
@@ -343,18 +382,12 @@ pub async fn run_web_server(
         eprintln!("(password also stored in ~/.pi-switch/webui_password)");
     }
 
-    // Enable graceful shutdown on Ctrl+C
-    let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-        eprintln!("\nReceived Ctrl+C, shutting down gracefully...");
-    };
+    // 优雅关闭：与代理一致，Rust 侧消费终止信号 + 超时强退兜底。
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
 
-    match axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await
-    {
+    match result {
         Ok(_) => Ok(()),
         Err(e) => Err(napi::Error::from_reason(format!("Server error: {}", e))),
     }
@@ -589,9 +622,7 @@ pub fn set_proxy_target(target: String) -> napi::Result<String> {
 }
 
 #[napi]
-pub fn set_proxy_rules(
-    rules: Vec<serde_json::Value>,
-) -> napi::Result<String> {
+pub fn set_proxy_rules(rules: Vec<serde_json::Value>) -> napi::Result<String> {
     let parsed: Vec<crate::config::FailoverRule> = rules
         .into_iter()
         .map(|v| serde_json::from_value(v).map_err(|e| napi::Error::from_reason(e.to_string())))
