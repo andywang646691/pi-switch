@@ -83,6 +83,20 @@ on:
 - 前台模式不写 pid 文件（避免与 daemon pid 文件冲突），失控清理靠 `proxy stop` 的端口兜底
 - Windows：`process.on('SIGTERM')` 无效但无害；Rust 侧 `not(unix)` 分支保持 ctrl_c + watchdog
 
+## CLI 语义教训（前台模式误判事故，2026-08-15）
+
+**`pi-switch proxy start` / `webui start` 不带 `--daemon` 就是前台模式：进程挂载前台、永不退出，这是设计行为，不是 bug。**
+
+### 事故经过
+
+重启 daemon 时误用了 `pi-switch proxy start`（不带 `--daemon`），看到命令 120s 不退出就断定“挂起”并超时杀掉——实际杀掉的是一个合法的前台实例。真正的守护进程方式是 `--daemon`。
+
+### 规则
+
+- 对不熟悉命令的异常行为（挂起、超时、无输出），**先读 `bin/pi-switch.js` 的 usage / 对应分支代码确认语义，再决定是否“修”**
+- 守护进程方式：`pi-switch proxy start --daemon`（spawn 独立子进程，日志写 `~/.pi-switch/proxy.log`）；前台方式用于调试，Ctrl+C 优雅退出
+- `proxy stop` 会按 pid 文件终止；前台实例无 pid 文件，靠端口反查兜底（见“信号处理”一节）
+
 ## 测试
 
 ```bash
