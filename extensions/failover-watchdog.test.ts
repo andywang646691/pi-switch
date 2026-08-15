@@ -4,6 +4,7 @@ import {
   parseRecoveryLine,
   selectNewEvents,
   latestEventTs,
+  eventsForConversation,
   isForkedProcess,
   CONTINUE_MESSAGE,
   POLL_INTERVAL_MS,
@@ -17,12 +18,25 @@ test("parseRecoveryLine parses a valid recovery event", () => {
     ts: 1786466000000,
     provider: "congee",
     chain: ["congee"],
+    conversations: undefined,
+  });
+});
+
+test("parseRecoveryLine parses affected conversations", () => {
+  const event = parseRecoveryLine(
+    '{"ts": 1, "provider": "congee", "conversations": ["sess-a", "sess-b"]}',
+  );
+  assert.deepEqual(event, {
+    ts: 1,
+    provider: "congee",
+    chain: undefined,
+    conversations: ["sess-a", "sess-b"],
   });
 });
 
 test("parseRecoveryLine tolerates a missing chain", () => {
   const event = parseRecoveryLine('{"ts": 1, "provider": "aihub"}');
-  assert.deepEqual(event, { ts: 1, provider: "aihub", chain: undefined });
+  assert.deepEqual(event, { ts: 1, provider: "aihub", chain: undefined, conversations: undefined });
 });
 
 test("parseRecoveryLine rejects empty, invalid JSON and wrong shapes", () => {
@@ -32,12 +46,17 @@ test("parseRecoveryLine rejects empty, invalid JSON and wrong shapes", () => {
   assert.equal(parseRecoveryLine('{"ts": "x", "provider": "a"}'), null); // ts 非数字
   assert.equal(parseRecoveryLine('{"ts": 1}'), null); // 缺 provider
   assert.equal(parseRecoveryLine("null"), null);
-  // chain 中的非字符串成员被过滤而非拒绝
+  // chain / conversations 中的非字符串成员被过滤而非拒绝
   assert.deepEqual(parseRecoveryLine('{"ts": 1, "provider": "a", "chain": [1, 2]}'), {
     ts: 1,
     provider: "a",
     chain: [],
+    conversations: undefined,
   });
+  assert.deepEqual(
+    parseRecoveryLine('{"ts": 1, "provider": "a", "conversations": [1, "sess-x"]}'),
+    { ts: 1, provider: "a", chain: undefined, conversations: ["sess-x"] },
+  );
 });
 
 test("selectNewEvents returns only events newer than the cursor, sorted", () => {
@@ -77,6 +96,26 @@ test("latestEventTs returns max ts and 0 for no events", () => {
     99,
   );
   assert.equal(latestEventTs([]), 0);
+});
+
+test("eventsForConversation only matches events naming this session", () => {
+  const mine = { ts: 1, provider: "a", conversations: ["sess-pi"] };
+  const others = { ts: 2, provider: "b", conversations: ["sess-other"] };
+  const legacy = { ts: 3, provider: "c" }; // 旧版代理事件, 无 conversations
+  const empty = { ts: 4, provider: "d", conversations: [] }; // 非 pi 客户端造成的故障
+
+  assert.deepEqual(eventsForConversation([mine, others, legacy, empty], "sess-pi"), [mine]);
+  // 其他会话的事件不命中
+  assert.deepEqual(eventsForConversation([mine, others, legacy, empty], "sess-other"), [others]);
+  // 拿不到自己的会话 id 时不发送任何 continue
+  assert.deepEqual(eventsForConversation([mine, others, legacy, empty], undefined), []);
+  // 事件缺失 conversations (旧版) 或为空 (非 pi 故障) 一律不命中
+  assert.deepEqual(eventsForConversation([legacy, empty], "sess-pi"), []);
+});
+
+test("eventsForConversation handles blank session id", () => {
+  const mine = { ts: 1, provider: "a", conversations: ["sess-pi"] };
+  assert.deepEqual(eventsForConversation([mine], ""), []);
 });
 
 test("extension constants are the documented values", () => {

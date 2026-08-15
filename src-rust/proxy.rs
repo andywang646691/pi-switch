@@ -106,6 +106,14 @@ pub struct CircuitEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "lastSuccessAt")]
     pub last_success_at: Option<u64>,
+    /// Conversation ids (x-conversation-id) whose requests failed against this
+    /// provider during the current outage episode. Non-pi clients (curl, other
+    /// agents) do not send that header, so their failures never register here —
+    /// recovery events only name the pi sessions that were actually affected.
+    /// Drained by `clear_circuit` (recovery event) or on a half-open success.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "affectedConversations")]
+    pub affected_conversations: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -288,7 +296,13 @@ fn is_circuit_open(
     }
 }
 
+/// Serializes read-modify-write cycles on circuit.json. Without it, concurrent
+/// requests (and parallel tests) can lose failure/success updates: each cycle
+/// reads the file, mutates the in-memory copy and rewrites it wholesale.
+static CIRCUIT_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn record_success(name: &str, half_open: bool) {
+    let _guard = CIRCUIT_STATE_LOCK.lock().await;
     let mut state = read_circuit_state().await;
     let entry = state
         .providers
@@ -299,6 +313,7 @@ async fn record_success(name: &str, half_open: bool) {
             last_failure_at: None,
             last_error: None,
             last_success_at: None,
+            affected_conversations: Vec::new(),
         });
 
     entry.failures = 0;
@@ -307,6 +322,9 @@ async fn record_success(name: &str, half_open: bool) {
     // If in half-open state and success, transition to closed
     if half_open {
         entry.opened_at = None;
+        // 本次 outage 由一次成功的请求收尾: 不会再有恢复事件, 登记过的
+        // 受影响会话一并清空 (否则会残留到下一次故障的恢复事件里)。
+        entry.affected_conversations.clear();
     }
 
     write_circuit_state(&state).await;
@@ -314,19 +332,67 @@ async fn record_success(name: &str, half_open: bool) {
 
 /// Exit circuit-break for a single provider (used by the recovery monitor):
 /// reset the failure count and clear the opened timestamp unconditionally,
-/// stamp a success. Returns true when the entry was open (a real recovery
-/// transition happened), false otherwise.
-pub(crate) async fn clear_circuit(name: &str) -> bool {
+/// stamp a success. Returns `(was_open, affected_conversations)`: whether the
+/// entry was open (a real recovery transition happened) and the conversation
+/// ids whose requests failed during the outage. The caller emits a recovery
+/// event only when `was_open`; the affected list lets each pi session decide
+/// whether the event concerns it (see failover-watchdog extension).
+pub(crate) async fn clear_circuit(name: &str) -> (bool, Vec<String>) {
+    let _guard = CIRCUIT_STATE_LOCK.lock().await;
     let mut state = read_circuit_state().await;
     let Some(entry) = state.providers.get_mut(name) else {
-        return false;
+        return (false, Vec::new());
     };
     let was_open = entry.opened_at.is_some();
     entry.failures = 0;
     entry.opened_at = None;
     entry.last_success_at = Some(now_ms());
+    let affected = std::mem::take(&mut entry.affected_conversations);
     write_circuit_state(&state).await;
-    was_open
+    (was_open, affected)
+}
+
+/// Cap on per-provider affected conversations so circuit.json stays small even
+/// under a long outage with many distinct sessions.
+const AFFECTED_CONVERSATIONS_CAP: usize = 64;
+
+/// Dedupe-append one conversation id to the affected list (FIFO eviction past
+/// the cap). Blank or missing ids are ignored — such requests are unlabeled
+/// (non-pi clients, Magic Context background tasks) and never notified.
+fn register_affected_conversation(entry: &mut CircuitEntry, conversation_id: Option<&str>) {
+    let Some(conversation_id) = conversation_id else {
+        return;
+    };
+    if conversation_id.trim().is_empty() {
+        return;
+    }
+    if entry.affected_conversations.iter().any(|c| c == conversation_id) {
+        return;
+    }
+    if entry.affected_conversations.len() >= AFFECTED_CONVERSATIONS_CAP {
+        entry.affected_conversations.remove(0);
+    }
+    entry.affected_conversations.push(conversation_id.to_string());
+}
+
+/// Register a conversation whose request was rejected because the provider's
+/// circuit was open. The outage may have been caused by another client — but
+/// this request did fail (circuit_open skip), so on recovery the session is
+/// notified and can retry.
+async fn note_affected(name: &str, conversation_id: Option<&str>) {
+    let Some(conversation_id) = conversation_id else {
+        return;
+    };
+    if conversation_id.trim().is_empty() {
+        return;
+    }
+    let _guard = CIRCUIT_STATE_LOCK.lock().await;
+    let mut state = read_circuit_state().await;
+    let Some(entry) = state.providers.get_mut(name) else {
+        return;
+    };
+    register_affected_conversation(entry, Some(conversation_id));
+    write_circuit_state(&state).await;
 }
 
 async fn record_failure(
@@ -334,10 +400,12 @@ async fn record_failure(
     settings: &CircuitBreakerSettings,
     reason: &str,
     half_open: bool,
+    conversation_id: Option<&str>,
 ) {
     if !settings.enabled {
         return;
     }
+    let _guard = CIRCUIT_STATE_LOCK.lock().await;
     let mut state = read_circuit_state().await;
     let entry = state
         .providers
@@ -348,11 +416,13 @@ async fn record_failure(
             last_failure_at: None,
             last_error: None,
             last_success_at: None,
+            affected_conversations: Vec::new(),
         });
 
     entry.failures += 1;
     entry.last_failure_at = Some(now_ms());
     entry.last_error = Some(reason.to_string());
+    register_affected_conversation(entry, conversation_id);
 
     // If half-open and failed, immediately reopen
     // If closed and reached threshold, open
@@ -2385,6 +2455,7 @@ async fn forward_responses_mixed(
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
         route_mark_attempt(name, is_half_open);
         if is_open {
+            note_affected(name, conversation_id).await;
             log_failed_attempt(
                 name,
                 Some("circuit_open"),
@@ -2603,6 +2674,7 @@ async fn forward_responses_mixed(
                     circuit_settings,
                     &format!("HTTP {status}"),
                     is_half_open,
+                    conversation_id,
                 )
                 .await;
                 log_failed_attempt(
@@ -2648,7 +2720,8 @@ async fn forward_responses_mixed(
             }
             Err(error) => {
                 let message = error.to_string();
-                record_failure(name, circuit_settings, &message, is_half_open).await;
+                record_failure(name, circuit_settings, &message, is_half_open, conversation_id)
+                    .await;
                 log_failed_attempt(
                     name,
                     Some(&message),
@@ -2698,6 +2771,7 @@ async fn forward_responses_mixed_stream(
         let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
         route_mark_attempt(name, is_half_open);
         if is_open {
+            note_affected(name, conversation_id).await;
             log_failed_attempt(
                 name,
                 Some("circuit_open"),
@@ -2857,6 +2931,7 @@ async fn forward_responses_mixed_stream(
                     circuit_settings,
                     &format!("HTTP {status}"),
                     is_half_open,
+                    conversation_id,
                 )
                 .await;
                 log_failed_attempt(
@@ -2901,7 +2976,8 @@ async fn forward_responses_mixed_stream(
             }
             Err(error) => {
                 let message = error.to_string();
-                record_failure(name, circuit_settings, &message, is_half_open).await;
+                record_failure(name, circuit_settings, &message, is_half_open, conversation_id)
+                    .await;
                 log_failed_attempt(
                     name,
                     Some(&message),
@@ -2970,6 +3046,7 @@ async fn forward_with_failover(
         route_mark_attempt(name, is_half_open);
 
         if is_open {
+            note_affected(name, conversation_id).await;
             log_request(
                 name,
                 false,
@@ -3095,6 +3172,7 @@ async fn forward_with_failover(
                             circuit_settings,
                             &format!("HTTP {status_code}"),
                             is_half_open,
+                            conversation_id,
                         )
                         .await;
                         log_request(
@@ -3153,7 +3231,14 @@ async fn forward_with_failover(
                     }
                 }
                 Err(e) => {
-                    record_failure(name, circuit_settings, &e.to_string(), is_half_open).await;
+                    record_failure(
+                        name,
+                        circuit_settings,
+                        &e.to_string(),
+                        is_half_open,
+                        conversation_id,
+                    )
+                    .await;
                     log_request(
                         name,
                         false,
@@ -3233,6 +3318,7 @@ async fn forward_with_failover(
                             circuit_settings,
                             &format!("HTTP {status_code}"),
                             is_half_open,
+                            conversation_id,
                         )
                         .await;
                         log_request(
@@ -3280,7 +3366,14 @@ async fn forward_with_failover(
                     }
                 }
                 Err(e) => {
-                    record_failure(name, circuit_settings, &e.to_string(), is_half_open).await;
+                    record_failure(
+                        name,
+                        circuit_settings,
+                        &e.to_string(),
+                        is_half_open,
+                        conversation_id,
+                    )
+                    .await;
                     log_request(
                         name,
                         false,
@@ -3331,6 +3424,7 @@ async fn forward_anthropic_with_failover(
         route_mark_attempt(name, is_half_open);
 
         if is_open {
+            note_affected(name, conversation_id).await;
             continue;
         }
 
@@ -3431,6 +3525,7 @@ async fn forward_anthropic_with_failover(
                     circuit_settings,
                     &format!("HTTP {status}"),
                     is_half_open,
+                    conversation_id,
                 )
                 .await;
                 // Capture the retryable error body raw too.
@@ -3442,7 +3537,8 @@ async fn forward_anthropic_with_failover(
                 continue;
             }
             Err(e) => {
-                record_failure(name, circuit_settings, &e.to_string(), is_half_open).await;
+                record_failure(name, circuit_settings, &e.to_string(), is_half_open, conversation_id)
+                    .await;
                 if let Some(client) = &raw {
                     crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
                         client,
@@ -3698,6 +3794,98 @@ mod tests {
             },
             providers: providers.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn affected_conversations_are_registered_on_failure_and_drained_on_recovery() {
+        let settings = crate::config::CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 5,
+            cooldown_seconds: 60,
+        };
+
+        // 无会话 id (非 pi 客户端) 的失败不登记任何会话
+        super::record_failure("up-a", &settings, "HTTP 503", false, None).await;
+        // 带会话 id 的失败登记该会话
+        super::record_failure("up-a", &settings, "HTTP 503", false, Some("sess-pi-1")).await;
+        super::record_failure("up-b", &settings, "network error", false, Some("sess-pi-2")).await;
+        // 重复登记去重
+        super::record_failure("up-a", &settings, "HTTP 503", false, Some("sess-pi-1")).await;
+
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("up-a").expect("up-a entry");
+        assert_eq!(a.affected_conversations, vec!["sess-pi-1"]);
+        assert_eq!(a.failures, 3);
+        let b = state.providers.get("up-b").expect("up-b entry");
+        assert_eq!(b.affected_conversations, vec!["sess-pi-2"]);
+
+        // 熔断阈值 (5) 未到, 电路未开
+        assert!(a.opened_at.is_none());
+
+        // 其他会话的失败也登记; 达到阈值后电路打开
+        super::record_failure("up-a", &settings, "HTTP 503", false, Some("sess-other")).await;
+        super::record_failure("up-a", &settings, "HTTP 503", false, Some("sess-other")).await;
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("up-a").unwrap();
+        assert_eq!(a.affected_conversations, vec!["sess-pi-1", "sess-other"]);
+        assert!(a.opened_at.is_some());
+
+        // 恢复: 受影响会话随恢复事件一并清空并返回
+        let (was_open, affected) = super::clear_circuit("up-a").await;
+        assert!(was_open);
+        assert_eq!(affected, vec!["sess-pi-1", "sess-other"]);
+
+        // 再次恢复无变更时 affected 为空
+        let (was_open, affected) = super::clear_circuit("up-a").await;
+        assert!(!was_open);
+        assert!(affected.is_empty());
+        let state = super::read_circuit_state().await;
+        assert!(state.providers.get("up-a").unwrap().affected_conversations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn note_affected_registers_skipped_requests_and_half_open_success_clears() {
+        let settings = crate::config::CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 3,
+            cooldown_seconds: 60,
+        };
+
+        // 电路打开后, 被 circuit_open 跳过的请求也会登记会话
+        super::record_failure("up-c", &settings, "HTTP 503", false, Some("sess-a")).await;
+        super::record_failure("up-c", &settings, "HTTP 503", false, Some("sess-a")).await;
+        super::record_failure("up-c", &settings, "HTTP 503", false, Some("sess-a")).await;
+        super::note_affected("up-c", Some("sess-b")).await;
+        super::note_affected("up-c", None).await; // 无会话 id 不登记
+
+        let state = super::read_circuit_state().await;
+        let c = state.providers.get("up-c").unwrap();
+        assert_eq!(c.affected_conversations, vec!["sess-a", "sess-b"]);
+
+        // half-open 成功: 电路关闭且受影响会话清空 (不会再有恢复事件)
+        super::record_success("up-c", true).await;
+        let state = super::read_circuit_state().await;
+        let c = state.providers.get("up-c").unwrap();
+        assert!(c.opened_at.is_none());
+        assert!(c.affected_conversations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn affected_conversations_cap_evicts_oldest() {
+        let settings = crate::config::CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 100,
+            cooldown_seconds: 60,
+        };
+        for i in 0..(super::AFFECTED_CONVERSATIONS_CAP + 5) {
+            super::record_failure("up-d", &settings, "HTTP 503", false, Some(&format!("sess-{i}")))
+                .await;
+        }
+        let state = super::read_circuit_state().await;
+        let affected = &state.providers.get("up-d").unwrap().affected_conversations;
+        assert_eq!(affected.len(), super::AFFECTED_CONVERSATIONS_CAP);
+        assert!(!affected.contains(&"sess-0".to_string()));
+        assert!(affected.contains(&"sess-67".to_string()));
     }
     #[tokio::test]
     async fn native_responses_non_streaming_preserves_body_and_response() {
@@ -5173,6 +5361,11 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_model_requests_larger_than_axum_default_body_limit() {
+        // 该请求会走到 no-route 错误路径, 处理器会向 raw log 追加一条记录;
+        // 与其他 raw-log 写入测试一样持锁, 避免与 rawlog 计数测试竞态。
+        let _guard = crate::rawlog::RAW_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let request_body = serde_json::json!({
             "model": "missing/model",
             "messages": [{ "role": "user", "content": "x".repeat(2 * 1024 * 1024) }],

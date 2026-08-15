@@ -169,7 +169,15 @@ async fn probe_healthy(url: &str, headers: &HeaderMap, timeout_ms: u64) -> bool 
 // ─── Recovery events ─────────────────────────────────────────────────────────
 
 pub fn recovery_log_path() -> std::path::PathBuf {
-    crate::config::config_dir().join("recovery.jsonl")
+    // 测试重定向到 per-process 临时目录, 不污染真实 ~/.pi-switch
+    #[cfg(test)]
+    {
+        crate::proxy::init_test_state_dir().join("recovery.jsonl")
+    }
+    #[cfg(not(test))]
+    {
+        crate::config::config_dir().join("recovery.jsonl")
+    }
 }
 
 fn now_ms() -> u64 {
@@ -179,13 +187,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Append one recovery event (JSON line). The file is trimmed to the last
-/// 200 lines when it grows past 1 MB so it stays a cheap tail-poll target.
-pub fn append_recovery_event(provider: &str, chain: &[String]) {
+/// Append one recovery event (JSON line). `conversations` are the session ids
+/// whose requests failed during the outage (see `CircuitEntry.affected_conversations`)
+/// — the pi extension only sends a "continue" for sessions named here, so failures
+/// caused by other (non-pi) clients never trigger a spurious retry. The file is
+/// trimmed to the last 200 lines when it grows past 1 MB so it stays a cheap
+/// tail-poll target.
+pub fn append_recovery_event(provider: &str, chain: &[String], conversations: &[String]) {
     let line = serde_json::json!({
         "ts": now_ms(),
         "provider": provider,
         "chain": chain,
+        "conversations": conversations,
     });
     let path = recovery_log_path();
     if let Some(parent) = path.parent() {
@@ -279,8 +292,11 @@ pub async fn monitor_tick(config: &PiSwitchConfig, settings: &MonitorSettings) {
     .await;
 
     for (name, chain, healthy) in results {
-        if healthy && crate::proxy::clear_circuit(&name).await {
-            append_recovery_event(&name, &chain);
+        if healthy {
+            let (was_open, conversations) = crate::proxy::clear_circuit(&name).await;
+            if was_open {
+                append_recovery_event(&name, &chain, &conversations);
+            }
         }
     }
 }
@@ -438,6 +454,7 @@ mod tests {
                 last_failure_at: Some(1000),
                 last_error: Some("HTTP 503".into()),
                 last_success_at: None,
+                affected_conversations: vec![],
             },
         );
         // only "a" open -> ["a","b"] not fully broken; "c" healthy
@@ -451,6 +468,7 @@ mod tests {
                 last_failure_at: Some(2000),
                 last_error: Some("HTTP 503".into()),
                 last_success_at: None,
+                affected_conversations: vec![],
             },
         );
         let broken = broken_chains(&config, &circuit);
@@ -491,6 +509,29 @@ mod tests {
         let (_url, headers) = build_probe(&p, "/models");
         assert_eq!(headers.get("x-custom").unwrap().to_str().unwrap(), "yes");
         assert_eq!(headers.get("x-extra").unwrap().to_str().unwrap(), "secret-1");
+    }
+
+    #[test]
+    fn recovery_event_includes_affected_conversations() {
+        // 指向测试状态目录, 不污染真实 ~/.pi-switch
+        let dir = crate::proxy::init_test_state_dir();
+        let path = dir.join("recovery.jsonl");
+        let _ = std::fs::remove_file(&path);
+        // 生产代码的 recovery_log_path 使用同一 state_dir (测试重定向)
+        append_recovery_event("up-a", &["up-a", "up-b"].map(String::from), &["sess-1", "sess-2"].map(String::from));
+        append_recovery_event("up-c", &["up-c"].map(String::from), &[]);
+
+        let text = std::fs::read_to_string(&path).expect("recovery log written");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid json line"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["provider"], "up-a");
+        assert_eq!(lines[0]["chain"], json!(["up-a", "up-b"]));
+        assert_eq!(lines[0]["conversations"], json!(["sess-1", "sess-2"]));
+        // 无受影响会话时仍写入空数组: watchdog 侧据此不触发 continue
+        assert_eq!(lines[1]["conversations"], json!([]));
     }
 
     #[test]

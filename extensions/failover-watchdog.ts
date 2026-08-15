@@ -2,9 +2,11 @@
  * pi-switch 恢复事件 → pi continue 桥接 (failover watchdog)
  *
  * 职责单一: 内核 (Rust 代理进程) 负责监测上游熔断、探测恢复、让节点退出熔断,
- * 并把每次节点恢复追加为一行 JSON 到 ~/.pi-switch/recovery.jsonl。
- * 本扩展只做一件事: 轮询该文件, 发现新恢复事件后以 user 身份向 pi 发送
- * 一条 "continue" 消息, 让 pi 重试被中断的任务。
+ * 并把每次节点恢复追加为一行 JSON 到 ~/.pi-switch/recovery.jsonl (事件携带
+ * 故障期间失败过的会话 id)。
+ * 本扩展只做一件事: 轮询该文件, 发现与本会话相关的新恢复事件后以 user 身份
+ * 向 pi 发送一条 "continue" 消息, 让 pi 重试被中断的任务。其他 agent 造成的
+ * 故障 (事件里没有本会话 id) 不会触发 continue; 多个 pi 实例也互不打扰。
  *
  * 无 slash 命令、无配置文件、不触碰 circuit.json。
  *
@@ -26,6 +28,14 @@ export type RecoveryEvent = {
   ts: number;
   provider: string;
   chain?: string[];
+  /**
+   * 故障期间请求失败过的会话 id (x-conversation-id)。只有出现在这里的
+   * pi 会话才会在恢复后收到 continue —— 非 pi 客户端 (curl、其他 agent)
+   * 的请求不携带会话标识, 不会出现在列表中, 因此它们的故障不会触发
+   * 任何会话的 continue。缺失该字段 (旧版代理写入的事件) 视为未知,
+   * 同样不触发。
+   */
+  conversations?: string[];
 };
 
 /**
@@ -47,12 +57,20 @@ export function parseRecoveryLine(line: string): RecoveryEvent | null {
   try {
     const obj: unknown = JSON.parse(trimmed);
     if (typeof obj !== "object" || obj === null) return null;
-    const { ts, provider, chain } = obj as { ts?: unknown; provider?: unknown; chain?: unknown };
+    const { ts, provider, chain, conversations } = obj as {
+      ts?: unknown;
+      provider?: unknown;
+      chain?: unknown;
+      conversations?: unknown;
+    };
     if (typeof ts !== "number" || typeof provider !== "string") return null;
     return {
       ts,
       provider,
       chain: Array.isArray(chain) ? chain.filter((c): c is string => typeof c === "string") : undefined,
+      conversations: Array.isArray(conversations)
+        ? conversations.filter((c): c is string => typeof c === "string")
+        : undefined,
     };
   } catch {
     return null;
@@ -72,6 +90,19 @@ export function selectNewEvents(text: string, cursorTs: number): RecoveryEvent[]
 /** 一组事件里的最大 ts (无事件时为 0)。 */
 export function latestEventTs(events: RecoveryEvent[]): number {
   return events.reduce((max, e) => Math.max(max, e.ts), 0);
+}
+
+/**
+ * 只保留与本会话相关的事件: 事件声明的 conversations 必须包含当前会话 id。
+ * 拿不到自己的会话 id, 或事件缺失 conversations (旧版代理/非 pi 故障),
+ * 一律视为与本会话无关, 不触发 continue。
+ */
+export function eventsForConversation(
+  events: RecoveryEvent[],
+  conversationId: string | undefined,
+): RecoveryEvent[] {
+  if (!conversationId) return [];
+  return events.filter((e) => (e.conversations ?? []).includes(conversationId));
 }
 
 export default function failoverWatchdogExtension(pi: ExtensionAPI): void {
@@ -103,6 +134,16 @@ export default function failoverWatchdogExtension(pi: ExtensionAPI): void {
     }
     const events = selectNewEvents(text, cursorTs);
     if (events.length === 0) return;
+
+    // 只响应与本会话相关的事件: 其他 agent 造成的故障恢复不会打扰本会话,
+    // 多个 pi 实例也各自只收到与自己相关的事件。
+    const ownId = latestCtx?.sessionManager?.getSessionId?.();
+    const mine = eventsForConversation(events, ownId);
+    // 非本会话的事件直接消费掉 (游标越过), 避免每轮重复扫描同一批事件。
+    if (mine.length === 0) {
+      cursorTs = latestEventTs(events);
+      return;
+    }
 
     sending = true;
     try {
