@@ -200,7 +200,7 @@ impl Default for MonitorSettings {
 /// (the part after the leading `profile/` namespace, e.g. `deepseek-v4-pro` for
 /// `ds/deepseek-v4-pro`). At least one condition must be set for the rule to be
 /// meaningful; conditions are ANDed when several are present.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuleMatch {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "modelPrefix")]
     pub model_prefix: Option<String>,

@@ -82,6 +82,7 @@ const zh: Record<string, string> = {
   "Set target profile": "设置目标供应商",
   "Failover chain": "故障转移链",
   "Failover rules": "故障转移规则",
+  "No exposed model matches this rule": "无暴露模型匹配此规则",
   "Rule-based, provider-level failover: the first matching rule decides the provider chain, tried in order. Proxy profiles are excluded.":
     "基于规则的 provider 级故障转移：第一条匹配的规则决定供应商链，按顺序尝试。代理 profile 不参与。",
   "No failover rules configured.": "未配置故障转移规则。",

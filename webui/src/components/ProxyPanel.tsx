@@ -1,9 +1,35 @@
 import { useEffect, useState } from "react";
-import type { AppState, DaemonResult, FailoverRule } from "../types";
+import type { AppState, DaemonResult, FailoverRule, ProviderProfile, RuleMatch } from "../types";
 import { api } from "../api";
 import { Badge, Button, Card, Field, Input, SectionTitle } from "./ui";
 import { useAction } from "./ui";
 import { useI18n } from "../i18n";
+
+/**
+ * Whether a profile can serve a rule's model conditions: the forwarding path
+ * (`effective_model_for`) accepts a model via an exact `exposedModels` hit or
+ * a `modelMap` entry, so a rule provider with neither matching any model the
+ * rule matches is silently skipped on every request. Mirrors the Rust-side
+ * `node_unserviceable` judgement (monitor.rs). Empty match conditions are not
+ * judged (the rule never routes anything).
+ */
+export function providerServesRule(
+  profile: ProviderProfile | undefined,
+  match: RuleMatch,
+): boolean {
+  if (!match.modelPrefix && !match.modelContains) return true;
+  if (!profile) return false;
+  const models = new Set<string>([
+    ...(profile.exposedModels ?? []),
+    ...Object.keys(profile.modelMap ?? {}),
+  ]);
+  for (const m of models) {
+    if (match.modelPrefix && !m.startsWith(match.modelPrefix)) continue;
+    if (match.modelContains && !m.includes(match.modelContains)) continue;
+    return true;
+  }
+  return false;
+}
 
 function MoveIcon({ direction }: { direction: "up" | "down" }) {
   return <svg className="control-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={direction === "up" ? "M8 12V4m-3 3 3-3 3 3" : "M8 4v8m-3-3 3 3 3-3"} /></svg>;
@@ -188,8 +214,23 @@ function RulesEditor({
                 <span className="mr-2 text-zinc-500">{i + 1}.</span>
                 {rule.name || `(rule ${i + 1})`}
               </span>
-              <div className="truncate text-xs text-zinc-500">
-                [{conditionText(rule)}] → {rule.providers.join(" → ") || "(no providers)"}
+              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-zinc-500">
+                <span>[{conditionText(rule)}] →</span>
+                {rule.providers.length === 0 && <span>(no providers)</span>}
+                {rule.providers.map((name, pidx) => {
+                  const serves = providerServesRule(state.profiles[name], rule.match);
+                  return (
+                    <span key={name} className="inline-flex items-center gap-1">
+                      {pidx > 0 && <span className="text-zinc-600">→</span>}
+                      <span className={serves ? "text-zinc-300" : "text-amber-300"}>{name}</span>
+                      {!serves && (
+                        <Badge tone="amber" >
+                          {t("No exposed model matches this rule")}
+                        </Badge>
+                      )}
+                    </span>
+                  );
+                })}
               </div>
             </div>
             <div className="flex gap-1">
@@ -234,7 +275,12 @@ function RulesEditor({
             )}
             {editing.providers.map((name, i) => (
               <div key={name} className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-zinc-950/40 px-2 py-1 text-sm">
-                <span className="text-zinc-200">{i + 1}. {name}</span>
+                <span className="flex items-center gap-2 text-zinc-200">
+                  <span>{i + 1}. {name}</span>
+                  {!providerServesRule(state.profiles[name], editing.match) && (
+                    <Badge tone="amber" >{t("No exposed model matches this rule")}</Badge>
+                  )}
+                </span>
                 <div className="flex gap-1">
                   <button aria-label="Move up" className="icon-button" onClick={() => providerMove(i, -1)}><MoveIcon direction="up" /></button>
                   <button aria-label="Move down" className="icon-button" onClick={() => providerMove(i, 1)}><MoveIcon direction="down" /></button>

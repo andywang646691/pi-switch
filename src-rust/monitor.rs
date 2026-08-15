@@ -1,11 +1,17 @@
 //! Upstream recovery monitor (runs inside the proxy process).
 //!
-//! When every node of a failover chain is circuit-open ("all upstreams
-//! broken"), the monitor enters watch mode: it periodically probes the broken
-//! nodes with a lightweight health request and clears a node's circuit the
-//! moment it answers healthily. Each recovery appends one JSON line to
-//! `~/.pi-switch/recovery.jsonl` — the pi extension watches that file and sends
-//! a "continue" user message so pi retries the interrupted request.
+//! When every node of a failover chain is unserviceable ("all upstreams
+//! broken"), the monitor enters watch mode: it periodically probes the
+//! circuit-open nodes with a lightweight health request and clears a node's
+//! circuit the moment it answers healthily. Each recovery appends one JSON
+//! line to `~/.pi-switch/recovery.jsonl` — the pi extension watches that file
+//! and sends a "continue" user message so pi retries the interrupted request.
+//!
+//! A node counts as unserviceable either because its circuit is open
+//! (transient — probed and recovered), or because it is structurally unable
+//! to serve the chain's models (missing profile, non-routable api kind, or no
+//! exposed/modelMapped model matches the rule's conditions — a config issue
+//! that probing cannot fix, surfaced by the WebUI rule view).
 //!
 //! Scope: the monitor never touches request routing; it only reacts to circuit
 //! state that the proxy itself wrote, and its recovery transition is identical
@@ -17,13 +23,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
-use crate::config::{load_config, MonitorSettings, PiSwitchConfig, ProxySettings};
+use crate::config::{load_config, MonitorSettings, PiSwitchConfig, ProxySettings, RuleMatch};
 use crate::proxy::{is_node_broken, CircuitStateStore};
 
 // ─── Failover chains ─────────────────────────────────────────────────────────
 
+/// One failover chain from the config: the ordered provider names plus the
+/// rule's model conditions. `rule_match` is `None` for chains without a model
+/// scope (legacy `failover` / `target` chains and standalone single-node
+/// chains) — those are judged on circuit state alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailoverChain {
+    pub providers: Vec<String>,
+    pub rule_match: Option<RuleMatch>,
+}
+
 /// Collect every failover chain from the config:
-///  1. `settings.proxy.rules[].providers` — one chain per rule
+///  1. `settings.proxy.rules[].providers` — one chain per rule (with its match)
 ///  2. legacy `settings.proxy.failover` — the global chain
 ///  3. fallback `[settings.proxy.target]` when neither exists
 ///  4. every other routable single profile (`proxy != true` and non-empty
@@ -33,22 +49,25 @@ use crate::proxy::{is_node_broken, CircuitStateStore};
 /// Profiles already covered by a rule/legacy chain are skipped in step 4: a
 /// single broken node inside a multi-node chain does not mean the gateway is
 /// down (failover keeps serving), so it must not trigger watch mode on its own.
-/// Identical chains are deduplicated.
-pub fn extract_chains(config: &PiSwitchConfig) -> Vec<Vec<String>> {
+/// Identical chains (same providers and same match) are deduplicated.
+pub fn extract_chains(config: &PiSwitchConfig) -> Vec<FailoverChain> {
     let proxy: &ProxySettings = &config.settings.proxy;
-    let mut chains: Vec<Vec<String>> = Vec::new();
+    let mut chains: Vec<FailoverChain> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     for rule in &proxy.rules {
-        push_chain(&mut chains, &mut seen, &rule.providers);
+        push_chain(&mut chains, &mut seen, &rule.providers, Some(&rule.r#match));
     }
     if !proxy.failover.is_empty() {
-        push_chain(&mut chains, &mut seen, &proxy.failover);
+        push_chain(&mut chains, &mut seen, &proxy.failover, None);
     } else if let Some(target) = &proxy.target {
-        push_chain(&mut chains, &mut seen, std::slice::from_ref(target));
+        push_chain(&mut chains, &mut seen, std::slice::from_ref(target), None);
     }
 
-    let covered: HashSet<String> = chains.iter().flatten().cloned().collect();
+    let covered: HashSet<String> = chains
+        .iter()
+        .flat_map(|c| c.providers.iter().cloned())
+        .collect();
     for (name, profile) in &config.profiles {
         if covered.contains(name.as_str()) {
             continue;
@@ -66,14 +85,19 @@ pub fn extract_chains(config: &PiSwitchConfig) -> Vec<Vec<String>> {
             .map(|arr| !arr.is_empty())
             .unwrap_or(false);
         if routable {
-            push_chain(&mut chains, &mut seen, std::slice::from_ref(name));
+            push_chain(&mut chains, &mut seen, std::slice::from_ref(name), None);
         }
     }
 
     chains
 }
 
-fn push_chain(chains: &mut Vec<Vec<String>>, seen: &mut HashSet<String>, chain: &[String]) {
+fn push_chain(
+    chains: &mut Vec<FailoverChain>,
+    seen: &mut HashSet<String>,
+    chain: &[String],
+    rule_match: Option<&RuleMatch>,
+) {
     let names: Vec<String> = chain
         .iter()
         .map(|s| s.trim().to_string())
@@ -82,16 +106,109 @@ fn push_chain(chains: &mut Vec<Vec<String>>, seen: &mut HashSet<String>, chain: 
     if names.is_empty() {
         return;
     }
-    if seen.insert(names.join("\u{0}")) {
-        chains.push(names);
+    // An empty match (no model conditions) is semantically identical to no
+    // model scope: normalize to None so dedup and unserviceability judgement
+    // treat both the same.
+    let rule_match = rule_match.filter(|m| !m.is_empty());
+    let match_key = rule_match.map(|m| format!("{m:?}")).unwrap_or_default();
+    if seen.insert(format!("{}\u{1}{match_key}", names.join("\u{0}"))) {
+        chains.push(FailoverChain {
+            providers: names,
+            rule_match: rule_match.cloned(),
+        });
     }
 }
 
-/// The chains whose every node is circuit-open right now.
-pub fn broken_chains(config: &PiSwitchConfig, circuit: &CircuitStateStore) -> Vec<Vec<String>> {
+/// Why a chain node cannot serve requests right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnserviceableReason {
+    /// Circuit-breaker open — transient, the monitor probes and recovers it.
+    CircuitOpen,
+    /// Structurally unserviceable: missing profile, non-routable api kind,
+    /// or no exposed/modelMapped model matches the rule. Probing cannot fix
+    /// this; it needs a config change (surfaced by the WebUI rule view).
+    Config,
+}
+
+/// Whether `name` can currently serve requests for its chain, and why not.
+/// A node is unserviceable when its circuit is open, or — for rule chains —
+/// when it is structurally unable to serve any model the rule matches. This
+/// mirrors the silent `continue` skips in the forwarding path
+/// (`effective_model_for` / api-kind checks), which never open a circuit, so
+/// without this the chain would look healthy while every request bypasses the
+/// node and lands on the fallback (or fails outright when the fallback is
+/// down too).
+pub fn node_unserviceable(
+    config: &PiSwitchConfig,
+    name: &str,
+    rule_match: Option<&RuleMatch>,
+    circuit: &CircuitStateStore,
+) -> Option<UnserviceableReason> {
+    if is_node_broken(name, circuit) {
+        return Some(UnserviceableReason::CircuitOpen);
+    }
+    // Only rule chains carry a model scope; legacy chains and standalone
+    // profiles are judged on circuit state alone.
+    let Some(rule_match) = rule_match else {
+        return None;
+    };
+    if rule_match.is_empty() {
+        // An empty match never routes anything (RuleMatch::matches is false),
+        // so the chain is never used; treat it as healthy, not broken.
+        return None;
+    }
+    let Some(profile) = config.profiles.get(name) else {
+        return Some(UnserviceableReason::Config);
+    };
+    if profile
+        .get("proxy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(UnserviceableReason::Config);
+    }
+    if !is_forwardable_api(profile) {
+        return Some(UnserviceableReason::Config);
+    }
+    if !profile_serves_match(profile, rule_match) {
+        return Some(UnserviceableReason::Config);
+    }
+    None
+}
+
+/// Whether the profile's api kind is one the forwarding path can dispatch
+/// (openai-completions / anthropic-messages / openai-responses).
+fn is_forwardable_api(profile: &Value) -> bool {
+    let api = profile.get("api").and_then(Value::as_str).unwrap_or("");
+    api == "openai-completions" || api == "anthropic-messages" || api == "openai-responses"
+}
+
+/// Whether the profile exposes or model-maps at least one model satisfying
+/// `rule_match` — the same eligibility the forwarding path applies via
+/// `effective_model_for` (exact exposedModels hit first, then modelMap).
+fn profile_serves_match(profile: &Value, rule_match: &RuleMatch) -> bool {
+    let mut models: Vec<String> = Vec::new();
+    if let Some(arr) = profile.get("exposedModels").and_then(Value::as_array) {
+        models.extend(arr.iter().filter_map(Value::as_str).map(String::from));
+    }
+    if let Some(map) = profile.get("modelMap").and_then(Value::as_object) {
+        models.extend(map.keys().cloned());
+    }
+    models.iter().any(|m| rule_match.matches(m))
+}
+
+/// The chains whose every node is unserviceable right now: circuit-open
+/// (transient — watch mode probes and recovers it) or structurally unable to
+/// serve the chain's models (config-level; probing would be futile, so those
+/// nodes are excluded from probing, and the WebUI rule view surfaces them).
+pub fn broken_chains(config: &PiSwitchConfig, circuit: &CircuitStateStore) -> Vec<FailoverChain> {
     extract_chains(config)
         .into_iter()
-        .filter(|chain| chain.iter().all(|name| is_node_broken(name, circuit)))
+        .filter(|chain| {
+            chain.providers.iter().all(|name| {
+                node_unserviceable(config, name, chain.rule_match.as_ref(), circuit).is_some()
+            })
+        })
         .collect()
 }
 
@@ -253,9 +370,11 @@ pub async fn run_monitor_loop() {
     }
 }
 
-/// One monitoring pass: for every fully-broken chain, probe the broken nodes
-/// concurrently and recover (clear circuit + emit event) the ones that answer
-/// healthily.
+/// One monitoring pass: for every fully-broken chain, probe the circuit-open
+/// nodes concurrently and recover (clear circuit + emit event) the ones that
+/// answer healthily. Structurally unserviceable nodes (config-level) are
+/// never probed — a healthy `/models` answer cannot restore a missing
+/// exposedModels entry.
 pub async fn monitor_tick(config: &PiSwitchConfig, settings: &MonitorSettings) {
     let circuit = crate::proxy::read_circuit_state().await;
     let broken = broken_chains(config, &circuit);
@@ -267,7 +386,7 @@ pub async fn monitor_tick(config: &PiSwitchConfig, settings: &MonitorSettings) {
     let mut probed: HashSet<String> = HashSet::new();
     let mut tasks: Vec<(String, Vec<String>, String, HeaderMap)> = Vec::new();
     for chain in &broken {
-        for name in chain {
+        for name in &chain.providers {
             if !is_node_broken(name, &circuit) || !probed.insert(name.clone()) {
                 continue;
             }
@@ -278,7 +397,7 @@ pub async fn monitor_tick(config: &PiSwitchConfig, settings: &MonitorSettings) {
             if url.is_empty() {
                 continue;
             }
-            tasks.push((name.clone(), chain.clone(), url, headers));
+            tasks.push((name.clone(), chain.providers.clone(), url, headers));
         }
     }
 
@@ -347,6 +466,14 @@ mod tests {
         config
     }
 
+    /// Providers of each chain, for compact assertions.
+    fn providers_of(chains: &[FailoverChain]) -> Vec<Vec<String>> {
+        chains
+            .iter()
+            .map(|c| c.providers.clone())
+            .collect::<Vec<_>>()
+    }
+
     #[test]
     fn extract_chains_collects_rule_chains_in_order() {
         let config = config_with(
@@ -355,16 +482,16 @@ mod tests {
             None,
             vec![],
         );
-        assert_eq!(extract_chains(&config), vec![vec!["a", "b"], vec!["c"]]);
+        assert_eq!(providers_of(&extract_chains(&config)), vec![vec!["a", "b"], vec!["c"]]);
     }
 
     #[test]
     fn extract_chains_falls_back_to_legacy_failover_then_target() {
         let via_failover = config_with(vec![], Some(vec!["a", "b"]), None, vec![]);
-        assert_eq!(extract_chains(&via_failover), vec![vec!["a", "b"]]);
+        assert_eq!(providers_of(&extract_chains(&via_failover)), vec![vec!["a", "b"]]);
 
         let via_target = config_with(vec![], None, Some("a"), vec![]);
-        assert_eq!(extract_chains(&via_target), vec![vec!["a"]]);
+        assert_eq!(providers_of(&extract_chains(&via_target)), vec![vec!["a"]]);
 
         let empty = PiSwitchConfig::default();
         assert!(extract_chains(&empty).is_empty());
@@ -378,7 +505,7 @@ mod tests {
             None,
             vec![],
         );
-        assert_eq!(extract_chains(&config), vec![vec!["a", "b"]]);
+        assert_eq!(providers_of(&extract_chains(&config)), vec![vec!["a", "b"]]);
 
         let empties = config_with(
             vec![(vec![], vec![]), (vec![], vec!["  "])],
@@ -400,7 +527,10 @@ mod tests {
                 ("yiapi", profile(&["gpt-y"])),
             ],
         );
-        assert_eq!(extract_chains(&config), vec![vec!["congee"], vec!["yiapi"]]);
+        assert_eq!(
+            providers_of(&extract_chains(&config)),
+            vec![vec!["congee"], vec!["yiapi"]]
+        );
     }
 
     #[test]
@@ -428,7 +558,10 @@ mod tests {
                 ("c", profile(&["m"])),
             ],
         );
-        assert_eq!(extract_chains(&config), vec![vec!["a", "b"], vec!["c"]]);
+        assert_eq!(
+            providers_of(&extract_chains(&config)),
+            vec![vec!["a", "b"], vec!["c"]]
+        );
     }
 
     #[test]
@@ -439,7 +572,21 @@ mod tests {
             None,
             vec![("a", profile(&["m"])), ("b", profile(&["m"]))],
         );
-        assert_eq!(extract_chains(&config), vec![vec!["a", "b"]]);
+        assert_eq!(providers_of(&extract_chains(&config)), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn extract_chains_keeps_rule_match_per_chain() {
+        let config = config_with(
+            vec![(vec!["gpt-"], vec!["a", "b"]), (vec!["claude"], vec!["a", "b"])],
+            None,
+            None,
+            vec![],
+        );
+        let chains = extract_chains(&config);
+        assert_eq!(chains.len(), 2, "same providers, different match = distinct chains");
+        assert_eq!(chains[0].rule_match.as_ref().unwrap().model_prefix.as_deref(), Some("gpt-"));
+        assert_eq!(chains[1].rule_match.as_ref().unwrap().model_prefix.as_deref(), Some("claude"));
     }
 
     #[test]
@@ -481,7 +628,106 @@ mod tests {
             },
         );
         let broken = broken_chains(&config, &circuit);
-        assert_eq!(broken, vec![vec!["a", "b"]]);
+        assert_eq!(providers_of(&broken), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn node_unserviceable_flags_missing_model_exposure_for_rule_chains() {
+        // ddd does not expose the rule's model family; gate does.
+        let config = config_with(
+            vec![(vec!["gpt-5.6-luna"], vec!["ddd", "gate"])],
+            None,
+            None,
+            vec![
+                ("ddd", profile(&["gpt-5.6-terra", "gpt-5.6-sol"])),
+                ("gate", profile(&["gpt-5.6-luna"])),
+            ],
+        );
+        let circuit = CircuitStateStore::default();
+        let rule = &config.settings.proxy.rules[0].r#match;
+        assert_eq!(
+            node_unserviceable(&config, "ddd", Some(rule), &circuit),
+            Some(UnserviceableReason::Config)
+        );
+        assert_eq!(
+            node_unserviceable(&config, "gate", Some(rule), &circuit),
+            None
+        );
+        // Legacy chains (no rule match) are judged on circuit state only.
+        assert_eq!(node_unserviceable(&config, "ddd", None, &circuit), None);
+    }
+
+    #[test]
+    fn node_unserviceable_counts_modelmap_and_api_kind() {
+        // modelMap keys count toward serving the rule.
+        let mut mapped = profile(&[]);
+        mapped["modelMap"] = json!({ "gpt-5.6-luna": "gpt-5.6-luna-up" });
+        let mut wrong_api = profile(&["gpt-5.6-luna"]);
+        wrong_api["api"] = json!("some-other-api");
+        let config = config_with(
+            vec![(vec!["gpt-5.6-luna"], vec!["mapped", "wrong-api"])],
+            None,
+            None,
+            vec![("mapped", mapped), ("wrong-api", wrong_api)],
+        );
+        let circuit = CircuitStateStore::default();
+        let rule = &config.settings.proxy.rules[0].r#match;
+        assert_eq!(node_unserviceable(&config, "mapped", Some(rule), &circuit), None);
+        assert_eq!(
+            node_unserviceable(&config, "wrong-api", Some(rule), &circuit),
+            Some(UnserviceableReason::Config)
+        );
+        // Missing profile is config-level unserviceable.
+        assert_eq!(
+            node_unserviceable(&config, "ghost", Some(rule), &circuit),
+            Some(UnserviceableReason::Config)
+        );
+    }
+
+    #[test]
+    fn broken_chains_treats_config_broken_nodes_as_broken() {
+        // ddd structurally cannot serve luna; gate circuit is open: chain is
+        // fully unserviceable and must enter watch mode (probe gate only).
+        let config = config_with(
+            vec![(vec!["gpt-5.6-luna"], vec!["ddd", "gate"])],
+            None,
+            None,
+            vec![
+                ("ddd", profile(&["gpt-5.6-terra"])),
+                ("gate", profile(&["gpt-5.6-luna"])),
+            ],
+        );
+        let mut circuit = CircuitStateStore::default();
+        circuit.providers.insert(
+            "gate".into(),
+            crate::proxy::CircuitEntry {
+                failures: 3,
+                opened_at: Some(1000),
+                last_failure_at: Some(1000),
+                last_error: Some("HTTP 500".into()),
+                last_success_at: None,
+                affected_conversations: vec![],
+            },
+        );
+        let broken = broken_chains(&config, &circuit);
+        assert_eq!(providers_of(&broken), vec![vec!["ddd", "gate"]]);
+
+        // gate healthy again -> chain is serviceable again (ddd alone does
+        // not make the chain broken: the fallback still serves).
+        let circuit = CircuitStateStore::default();
+        assert!(broken_chains(&config, &circuit).is_empty());
+    }
+
+    #[test]
+    fn empty_match_rule_is_never_broken() {
+        let config = config_with(
+            vec![(vec![], vec!["a", "b"])],
+            None,
+            None,
+            vec![("a", profile(&["x"])), ("b", profile(&["y"]))],
+        );
+        let circuit = CircuitStateStore::default();
+        assert!(broken_chains(&config, &circuit).is_empty());
     }
 
     #[test]

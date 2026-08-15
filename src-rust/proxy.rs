@@ -2511,6 +2511,7 @@ async fn forward_responses_mixed(
         // The model id this provider actually serves: its modelMap mapping wins, then
         // an exact exposedModels hit. Providers that cannot serve the model are skipped.
         let Some(effective) = effective_model_for(config, name, real_model) else {
+            append_skip_log(name, real_model);
             continue;
         };
         // Rewrite the requested model to the provider's effective upstream id.
@@ -2833,6 +2834,7 @@ async fn forward_responses_mixed_stream(
         // The model id this provider actually serves: its modelMap mapping wins, then
         // an exact exposedModels hit. Providers that cannot serve the model are skipped.
         let Some(effective) = effective_model_for(config, name, real_model) else {
+            append_skip_log(name, real_model);
             continue;
         };
         // Rewrite the requested model to the provider's effective upstream id.
@@ -3124,6 +3126,7 @@ async fn forward_with_failover(
         // The model id this provider actually serves: its modelMap mapping wins, then
         // an exact exposedModels hit. Providers that cannot serve the model are skipped.
         let Some(effective) = effective_model_for(config, name, real_model) else {
+            append_skip_log(name, real_model);
             continue;
         };
         // Rewrite the requested model to the provider's effective upstream id.
@@ -3474,6 +3477,7 @@ async fn forward_anthropic_with_failover(
         // The model id this provider actually serves: its modelMap mapping wins, then
         // an exact exposedModels hit. Providers that cannot serve the model are skipped.
         let Some(effective) = effective_model_for(config, name, real_model) else {
+            append_skip_log(name, real_model);
             continue;
         };
         // Rewrite the requested model to the provider's effective upstream id.
@@ -3683,6 +3687,64 @@ fn append_log_line(entry: &Value) {
         }
     }
     trim_requests_log();
+}
+
+/// Append one structurally-skipped route decision to `skips.log`: a provider
+/// that could not serve the requested model (no `exposedModels` / `modelMap`
+/// match) and was silently bypassed by the failover loop. Kept separate from
+/// `requests.log` so stats aggregation is untouched — the WebUI rule view
+/// surfaces the same condition statically, and this file makes every skip
+/// traceable (ts, provider, model). Synchronous: same append pattern as
+/// [`append_log_line`].
+fn append_skip_log(provider: &str, model: &str) {
+    // Concurrent requests append from multiple tasks; serialize the
+    // open+write so lines never interleave or lose their trailing newline.
+    static SKIP_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SKIP_LOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let log_path = state_dir().join("skips.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let entry = serde_json::json!({
+        "ts": Utc::now().to_rfc3339(),
+        "provider": provider,
+        "model": model,
+        "reason": "model_not_exposed",
+    });
+    if let Ok(json) = serde_json::to_string(&entry) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{json}");
+        }
+    }
+    trim_skips_log();
+}
+
+/// How many skip lines `skips.log` keeps; older entries are dropped on append
+/// so the file stays bounded.
+pub const SKIP_LOG_MAX_LINES: usize = 1000;
+
+/// Keep only the most recent [`SKIP_LOG_MAX_LINES`] lines of `skips.log`.
+/// Best-effort. Must be called with `SKIP_LOG_LOCK` held.
+fn trim_skips_log() {
+    let log_path = state_dir().join("skips.log");
+    let Ok(text) = std::fs::read_to_string(&log_path) else {
+        return;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > SKIP_LOG_MAX_LINES {
+        let _ = std::fs::write(
+            &log_path,
+            lines[lines.len() - SKIP_LOG_MAX_LINES..].join("\n") + "\n",
+        );
+    }
 }
 
 /// How many days of request metadata `requests.log` keeps; older entries are
@@ -5444,6 +5506,38 @@ mod tests {
         super::append_log_line(&serde_json::json!({ "probe": "isolation" }));
         let text = std::fs::read_to_string(&log_path).expect("log written to isolated dir");
         assert!(text.contains("\"probe\":\"isolation\""));
+    }
+
+    #[test]
+    fn append_skip_log_writes_json_lines_to_isolated_dir() {
+        let dir = super::init_test_state_dir();
+        let log_path = dir.join("skips.log");
+        let _ = std::fs::remove_file(&log_path);
+        super::append_skip_log("ddd", "gpt-5.6-luna");
+        let text = std::fs::read_to_string(&log_path).expect("skip log written");
+        let entry: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(entry["provider"], "ddd");
+        assert_eq!(entry["model"], "gpt-5.6-luna");
+        assert_eq!(entry["reason"], "model_not_exposed");
+        assert!(entry["ts"].as_str().is_some());
+    }
+
+    #[test]
+    fn skip_log_trimmed_to_max_lines() {
+        let dir = super::init_test_state_dir();
+        let log_path = dir.join("skips.log");
+        let _ = std::fs::remove_file(&log_path);
+        for i in 0..(super::SKIP_LOG_MAX_LINES + 50) {
+            super::append_skip_log("ddd", &format!("model-{i}"));
+        }
+        let text = std::fs::read_to_string(&log_path).expect("skip log written");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), super::SKIP_LOG_MAX_LINES);
+        assert!(
+            text.contains("\"model-50\""),
+            "oldest 50 entries dropped, the first kept line is model-50"
+        );
+        assert!(text.contains("\"model-1049\""), "latest entry kept");
     }
 
     #[test]
