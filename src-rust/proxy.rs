@@ -250,7 +250,14 @@ pub async fn write_circuit_state(state: &CircuitStateStore) {
         std::fs::create_dir_all(parent).ok();
     }
     if let Ok(json) = serde_json::to_string_pretty(state) {
-        std::fs::write(&path, json).ok();
+        // Atomic write: write a temp file in the same dir, then rename over the
+        // target. Readers outside the lock (health probe, stats, tests) must
+        // never observe a truncated/half-written file — on slow CI filesystems
+        // a plain fs::write read mid-write parses to empty state and panics.
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
