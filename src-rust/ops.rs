@@ -372,7 +372,7 @@ pub async fn test_provider(name: &str) -> Result<TestResult> {
         req = req.header(*key, *value);
     }
     let ua_label = effective_spoof
-        .map(|p| crate::proxy::resolve_user_agent(p))
+        .map(crate::proxy::resolve_user_agent)
         .unwrap_or("default");
 
     match req.send().await {
