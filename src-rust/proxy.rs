@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 // name prefix, not the version, so static values stay valid across client upgrades.
 
 /// Resolve the actual User-Agent string from a disguise preset key.
-fn resolve_user_agent(preset: &str) -> &str {
+pub(crate) fn resolve_user_agent(preset: &str) -> &str {
     match preset {
         // Real Claude Code CLI sends `claude-cli/<ver> (external, cli)`, not `claude-code/...`.
         "claude-code" => "claude-cli/2.1.161 (external, cli)",
@@ -35,7 +35,7 @@ fn resolve_user_agent(preset: &str) -> &str {
 /// Static extra headers a real client of the given preset also sends.
 /// (No synthesized session/traceparent — random values never pass deep checks and
 /// aren't needed for prefix-only UA whitelists.)
-fn disguise_headers(preset: Option<&str>) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn disguise_headers(preset: Option<&str>) -> Vec<(&'static str, &'static str)> {
     match preset {
         Some("claude-code") => vec![
             ("anthropic-version", "2023-06-01"),

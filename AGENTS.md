@@ -54,6 +54,21 @@ on:
 
 **规则：每次功能完成后，必须检查并完成打 tag 发布，否则 CI 不构建、npm 不更新。** WebUI 改动只有发布新版本用户才能看到——因为 WebUI 是编译期嵌入二进制的。
 
+### 扩展发布后必须同步 pi 的扩展仓库（误报 continue 事故，2026-08-16）
+
+**pi 加载的扩展装在 `~/.pi/agent/npm/node_modules/@andywangzzm/pi-switch/`，与全局 npm 安装（mise/node 的 `npm i -g`）是两个独立副本。** 只 `npm publish` 不更新前者，pi 进程加载的永远是旧扩展。
+
+事故：0.5.5 扩展在 `~/.pi/agent/npm` 从未刷新，0.5.10 已含会话过滤（cafa556）但 pi 仍跑旧逻辑——非 pi 客户端（无 x-conversation-id）的请求熔断 gate 后，恢复事件（`conversations:[]`）被**所有** pi 会话的旧扩展当成自己的事件，全部收到虚假 continue。
+
+**每次发布新版本后必须执行：**
+
+```bash
+pi update npm:@andywangzzm/pi-switch   # 或 pi update --extensions
+# 验证：grep 版本号 ~/.pi/agent/npm/node_modules/@andywangzzm/pi-switch/package.json
+```
+
+已运行的 pi 进程内存里仍是旧扩展，需重启会话才生效。
+
 ### CI 构建范围（2026-08-15 调整）
 
 `.github/workflows/ci.yml` 默认**只构建 macOS 两个平台**（x86_64 / aarch64）：

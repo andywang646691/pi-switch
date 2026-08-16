@@ -318,11 +318,20 @@ pub async fn test_provider(name: &str) -> Result<TestResult> {
 
     let start = std::time::Instant::now();
 
-    // Build test request based on API type
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+    // Apply the User-Agent disguise (profile overrides global), matching the proxy
+    // path — UA-gated upstreams (e.g. ai.centos.hk) reject plain reqwest clients
+    // with their default UA.
+    let global_spoof = config.settings.proxy.user_agent.as_deref();
+    let effective_spoof = profile.spoof.as_deref().or(global_spoof);
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10));
+    if let Some(spoof) = effective_spoof {
+        builder = builder.user_agent(crate::proxy::resolve_user_agent(spoof));
+    }
+    let client = builder
         .build()
         .map_err(|e| AppError::Message(format!("HTTP client error: {}", e)))?;
+    let disguise = crate::proxy::disguise_headers(effective_spoof);
 
     let test_body = match profile.api.as_str() {
         "openai-completions" => serde_json::json!({
@@ -358,6 +367,13 @@ pub async fn test_provider(name: &str) -> Result<TestResult> {
     } else {
         req = req.header("Authorization", format!("Bearer {}", profile.api_key));
     }
+    // Extra headers a real client of the disguise preset sends (e.g. anthropic-*).
+    for (key, value) in &disguise {
+        req = req.header(*key, *value);
+    }
+    let ua_label = effective_spoof
+        .map(|p| crate::proxy::resolve_user_agent(p))
+        .unwrap_or("default");
 
     match req.send().await {
         Ok(resp) => {
@@ -367,7 +383,11 @@ pub async fn test_provider(name: &str) -> Result<TestResult> {
             if status.is_success() {
                 Ok(TestResult {
                     success: true,
-                    message: format!("✓ Connected successfully (HTTP {})", status.as_u16()),
+                    message: format!(
+                        "✓ Connected successfully (HTTP {}, UA: {})",
+                        status.as_u16(),
+                        ua_label
+                    ),
                     response_time_ms: Some(elapsed),
                 })
             } else {
@@ -375,8 +395,9 @@ pub async fn test_provider(name: &str) -> Result<TestResult> {
                 Ok(TestResult {
                     success: false,
                     message: format!(
-                        "✗ HTTP {} - {}",
+                        "✗ HTTP {} (UA: {}) - {}",
                         status.as_u16(),
+                        ua_label,
                         error_text.chars().take(100).collect::<String>()
                     ),
                     response_time_ms: Some(elapsed),
@@ -406,10 +427,19 @@ pub async fn fetch_models(name: &str) -> Result<Vec<String>> {
     let profile: ProviderProfile = serde_json::from_value(profile_value.clone())
         .map_err(|e| AppError::Message(format!("invalid profile: {}", e)))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+    // Apply the User-Agent disguise (profile overrides global), matching the proxy
+    // path — UA-gated upstreams (e.g. ai.centos.hk) reject plain reqwest clients.
+    let global_spoof = config.settings.proxy.user_agent.as_deref();
+    let effective_spoof = profile.spoof.as_deref().or(global_spoof);
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10));
+    if let Some(spoof) = effective_spoof {
+        builder = builder.user_agent(crate::proxy::resolve_user_agent(spoof));
+    }
+    let client = builder
         .build()
         .map_err(|e| AppError::Message(format!("HTTP client error: {}", e)))?;
+    let disguise = crate::proxy::disguise_headers(effective_spoof);
 
     let api_key = crate::config::resolve_env(&profile.api_key);
 
@@ -428,6 +458,10 @@ pub async fn fetch_models(name: &str) -> Result<Vec<String>> {
                 .header("anthropic-version", "2023-06-01"),
             _ => req.header("Authorization", format!("Bearer {}", api_key)),
         };
+        // Extra headers a real client of the disguise preset sends.
+        for (key, value) in &disguise {
+            req = req.header(*key, *value);
+        }
 
         match req.send().await {
             Ok(resp) => {
