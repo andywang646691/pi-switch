@@ -66,6 +66,8 @@ export interface FailoverRule {
   name?: string;
   match: RuleMatch;
   providers: string[];
+  /** Chain selection: stable = healthiest-first (default), cost = configured order. */
+  mode?: "stable" | "cost";
 }
 
 export interface ProxySettings {

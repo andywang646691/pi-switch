@@ -1022,6 +1022,7 @@ pub(super) fn render_rules_editor(frame: &mut Frame<'_>, app: &App, area: Rect) 
         ("n", if i18n::is_zh() { "名称" } else { "Name" }),
         ("e", if i18n::is_zh() { "匹配条件" } else { "Match" }),
         ("p", if i18n::is_zh() { "供应商链" } else { "Providers" }),
+        ("m", if i18n::is_zh() { "模式" } else { "Mode" }),
         ("i", if i18n::is_zh() { "新增" } else { "Insert" }),
         ("d", if i18n::is_zh() { "删除" } else { "Delete" }),
         ("s", i18n::key_save()),
@@ -1070,9 +1071,25 @@ pub(super) fn render_rules_editor(frame: &mut Frame<'_>, app: &App, area: Rect) 
             } else {
                 rule.providers.join(" → ")
             };
+            let mode = match rule.mode {
+                crate::config::RuleMode::Stable => {
+                    if i18n::is_zh() {
+                        "稳定优先"
+                    } else {
+                        "stable"
+                    }
+                }
+                crate::config::RuleMode::Cost => {
+                    if i18n::is_zh() {
+                        "成本优先"
+                    } else {
+                        "cost"
+                    }
+                }
+            };
             ListItem::new(format!(
-                "  {}  [{}]  {}",
-                name, match_str, chain
+                "  {}  [{}]  {}  ({})",
+                name, match_str, chain, mode
             ))
         })
         .collect();

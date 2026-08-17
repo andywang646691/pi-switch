@@ -1,6 +1,6 @@
 {
   "name": "@andywangzzm/pi-switch",
-  "version": "0.5.12",
+  "version": "0.5.13",
   "description": "Lightweight profile switcher for pi models.json",
   "type": "module",
   "bin": {

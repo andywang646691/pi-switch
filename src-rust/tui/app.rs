@@ -21,6 +21,8 @@ pub struct RuleDraft {
     pub prefix: String,
     pub contains: String,
     pub providers: Vec<String>,
+    /// Chain selection mode (stable/cost); toggled with `m` in the list view.
+    pub mode: crate::config::RuleMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1182,6 +1184,7 @@ impl App {
                 prefix: rule.r#match.model_prefix.clone().unwrap_or_default(),
                 contains: rule.r#match.model_contains.clone().unwrap_or_default(),
                 providers: rule.providers.clone(),
+                mode: rule.mode,
             });
         }
         self.rules_editor.rules = rules;
@@ -1288,6 +1291,13 @@ impl App {
                     );
                     self.rules_editor.idx += 1;
                 }
+            }
+            KeyCode::Char('m') => {
+                let rule = &mut self.rules_editor.rules[self.rules_editor.idx];
+                rule.mode = match rule.mode {
+                    crate::config::RuleMode::Stable => crate::config::RuleMode::Cost,
+                    crate::config::RuleMode::Cost => crate::config::RuleMode::Stable,
+                };
             }
             KeyCode::Char('i') => {
                 // Insert a new rule after the current one
@@ -1453,6 +1463,7 @@ impl App {
                     },
                 },
                 providers: r.providers.clone(),
+                mode: r.mode,
             })
             .collect();
 

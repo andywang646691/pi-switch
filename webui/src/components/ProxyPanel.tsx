@@ -213,6 +213,9 @@ function RulesEditor({
               <span className="text-zinc-200">
                 <span className="mr-2 text-zinc-500">{i + 1}.</span>
                 {rule.name || `(rule ${i + 1})`}
+                <Badge tone={rule.mode === "cost" ? "indigo" : "green"}>
+                  {rule.mode === "cost" ? t("Cost-first") : t("Stability-first")}
+                </Badge>
               </span>
               <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-zinc-500">
                 <span>[{conditionText(rule)}] →</span>
@@ -266,6 +269,18 @@ function RulesEditor({
                 placeholder="deepseek"
                 onChange={(e) => setEditing({ ...editing, match: { ...editing.match, modelContains: e.target.value } })}
               />
+            </Field>
+          </div>
+          <div className="mb-3 flex items-center gap-3">
+            <Field label={t("Chain selection")}>
+              <select
+                className="rounded-md border border-white/10 bg-zinc-950/60 px-2 py-1.5 text-sm text-zinc-100"
+                value={editing.mode ?? "stable"}
+                onChange={(e) => setEditing({ ...editing, mode: e.target.value as "stable" | "cost" })}
+              >
+                <option value="stable">{t("Stability-first (healthiest node first, adaptive)")}</option>
+                <option value="cost">{t("Cost-first (configured order, immediate failback)")}</option>
+              </select>
             </Field>
           </div>
           <div className="mb-2 text-xs font-medium text-zinc-300">{t("Provider chain (order = failover order)")}</div>

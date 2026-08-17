@@ -245,9 +245,11 @@ pi-switch proxy start --daemon
 
 - **模型名路由** — `"model": "provider-a/gpt-5.4"` 解析为 profile `provider-a`、真实模型 `gpt-5.4`；转发前代理将 body.model 改回真实 ID
 - **单个网关 provider** — pi 只看到一个 `pi-switch` provider，下面列出所有暴露模型（格式 `profile/真实模型ID`）；在 pi 中切换模型 = 发送不同的 model 字符串 = 即时路由切换
-- **规则故障转移** — 第一条匹配请求模型的规则决定 provider 链，429/5xx 或网络错误时按顺序尝试（provider 级粒度；provider 可通过 `modelMap` 映射模型）
-- **断路器保护** — 连续 3 次失败后进入 60s 冷却，半开探测成功后自动恢复
-- **上游恢复监测** — 链路所有上游都熔断时，代理内核按 `settings.proxy.monitor` 配置定期探测熔断节点；节点恢复即退出熔断并追加一行到 `recovery.jsonl`，pi 扩展监听到后自动发一条 `continue` 让 pi 重试。恢复事件携带故障期间失败请求的会话 id——**只有真正受影响的 pi 会话才会收到 `continue`**；其他客户端（curl、其他 agent，不带 `x-conversation-id`）造成的故障不会触发任何会话的 continue
+- **规则故障转移** — 第一条匹配请求模型的规则决定 provider 链，429/5xx 或网络错误时按顺序尝试（provider 级粒度；provider 可通过 `modelMap` 映射模型）。每条规则可配 `mode` 选择行为（默认 `stable`）：
+  - `"mode": "stable"`（**稳定优先**，默认）— 候选按近期 EWMA 成功率得分排序（健康度高的先试，得分存于 `circuit.json` 每个节点的 `score` 字段）；节点恢复后再次快速失败（波动）时，冷却时间按 2^波动次数递增（上限 32×，60s 基线 → 最长约 32 分钟）。退避只作用于流量路径（半开放探测与冷却扩展）：链上还有健康节点时，波动节点不会抢在它们前面回归；当整条链都不可用时，恢复监测器仍会急切探测，全量故障也能在一个探测周期内恢复。目标是最大化上游成功率。
+  - `"mode": "cost"`（**成本优先**）— 完全保持原始行为：按配置顺序尝试、固定冷却、恢复后立即回切，配置的链首只要熔断关闭就优先使用。
+- **断路器保护** — 连续 3 次失败后进入 60s 冷却，半开探测成功后自动恢复（成本模式为固定 60s；稳定模式多节点链路按波动次数退避）
+- **上游恢复监测** — 链路所有上游都熔断时，代理内核按 `settings.proxy.monitor` 配置定期探测熔断节点；节点恢复即退出熔断并追加一行到 `recovery.jsonl`，pi 扩展监听到后自动发一条 `continue` 让 pi 重试。恢复事件携带故障期间失败请求的会话 id——**只有真正受影响的 pi 会话才会收到 `continue`**；其他客户端（curl、其他 agent，不带 `x-conversation-id`）造成的故障不会触发任何会话的 continue。监测器对所有模式一视同仁：它只在整条链都不可用的场景下探测（此时没有健康节点会被扰动，急切恢复永远是正确选择），不因退避而推迟
 - **流式（SSE）** — 同格式请求（openai→openai、anthropic→anthropic）逐字流式转发；保留上游响应头（Content-Type 等）
 - **OpenAI ↔ Anthropic** — 自动在 chat completions 和 messages API 间转换
 - **User-Agent 伪装** — 内置 Claude Code / Codex / Gemini 预设，发送对应客户端的真实 User-Agent（及 `anthropic-beta` 等头）以通过上游客户端校验；支持全局或按 profile 设置

@@ -380,7 +380,13 @@ pub async fn monitor_tick(config: &PiSwitchConfig, settings: &MonitorSettings) {
         return;
     }
 
-    // 收集待探测节点 (去重), 并发探测, 避免 N 个节点串行等待超时
+    // 收集待探测节点 (去重), 并发探测, 避免 N 个节点串行等待超时。
+    //
+    // 注意: monitor 只处理“全链都不可用”的链 (broken_chains 的判定),
+    // 此时不存在健康节点会被“插队”, 探测恢复是零成本兜底 —— 因此不做
+    // 任何退避/冷却跳过 (流量路径的半开放探测 + 冷却扩展才是防抖动的地方:
+    // 链上有健康节点时, 波动节点不会抢在它们前面回归)。全链故障时
+    // monitor 越快发现任意节点恢复越好。
     let mut probed: HashSet<String> = HashSet::new();
     let mut tasks: Vec<(String, Vec<String>, String, HeaderMap)> = Vec::new();
     for chain in &broken {
@@ -424,6 +430,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// recovery.jsonl is a shared append file; the two tests that write/read it
+    /// serialize on this mutex so parallel runs cannot interleave lines.
+    static RECOVERY_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn profile(exposed: &[&str]) -> Value {
         let mut p = json!({
             "api": "openai-completions",
@@ -455,6 +465,7 @@ mod tests {
                     model_contains: m.get(1).map(|s| s.to_string()),
                 },
                 providers: providers.into_iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             })
             .collect();
         config.settings.proxy.failover = failover
@@ -609,6 +620,7 @@ mod tests {
                 last_error: Some("HTTP 503".into()),
                 last_success_at: None,
                 affected_conversations: vec![],
+                ..Default::default()
             },
         );
         // only "a" open -> ["a","b"] not fully broken; "c" healthy
@@ -623,6 +635,7 @@ mod tests {
                 last_error: Some("HTTP 503".into()),
                 last_success_at: None,
                 affected_conversations: vec![],
+                ..Default::default()
             },
         );
         let broken = broken_chains(&config, &circuit);
@@ -705,6 +718,7 @@ mod tests {
                 last_error: Some("HTTP 500".into()),
                 last_success_at: None,
                 affected_conversations: vec![],
+                ..Default::default()
             },
         );
         let broken = broken_chains(&config, &circuit);
@@ -714,6 +728,106 @@ mod tests {
         // not make the chain broken: the fallback still serves).
         let circuit = CircuitStateStore::default();
         assert!(broken_chains(&config, &circuit).is_empty());
+    }
+
+    /// A single upstream that answers /models OK (proxy serves /v1/models).
+    async fn spawn_healthy_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/models",
+                    axum::routing::get(async || {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from("ok"))
+                            .unwrap()
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std Mutex serializes the shared recovery.jsonl; tokio::test runs on a single-threaded runtime
+    async fn monitor_recovers_broken_chain_even_at_max_backoff() {
+        // 回归保护: monitor 只处理“全链都不可用”的链, 此时即使节点的退避
+        // 计数已拉满 (recoveryFailCount = BACKOFF_CAP), 也必须急切探测并
+        // 恢复健康节点 —— 退避只该约束流量路径, 不能把全链故障的恢复拖慢。
+        let healthy_addr = spawn_healthy_upstream().await;
+        let config = config_with(
+            vec![(vec!["gw-"], vec!["a", "b"])],
+            None,
+            None,
+            vec![
+                (
+                    "a",
+                    json!({
+                        "api": "openai-completions",
+                        "apiKey": "sk-test",
+                        "baseUrl": format!("http://{}/v1", healthy_addr),
+                        "exposedModels": ["gw-m"]
+                    }),
+                ),
+                (
+                    "b",
+                    json!({
+                        "api": "openai-completions",
+                        "apiKey": "sk-test",
+                        "baseUrl": "http://127.0.0.1:9/v1", // discard port: connect fails fast
+                        "exposedModels": ["gw-m"]
+                    }),
+                ),
+            ],
+        );
+        // 全链熔断, 且退避计数拉满: 旧的实现会因退避跳过探测而干等, 现在必须恢复。
+        let mut circuit = CircuitStateStore::default();
+        for name in ["a", "b"] {
+            circuit.providers.insert(
+                name.into(),
+                crate::proxy::CircuitEntry {
+                    failures: 3,
+                    opened_at: Some(now_ms()),
+                    last_failure_at: Some(now_ms()),
+                    last_error: Some("HTTP 503".into()),
+                    last_success_at: None,
+                    affected_conversations: vec![],
+                    recovery_fail_count: crate::proxy::BACKOFF_CAP,
+                    ..Default::default()
+                },
+            );
+        }
+        let _recovery_guard = RECOVERY_LOG_LOCK.lock().unwrap();
+        crate::proxy::seed_circuit_entries(circuit.providers.into_iter().collect()).await;
+        let log_path = crate::proxy::init_test_state_dir().join("recovery.jsonl");
+        let _ = std::fs::remove_file(&log_path);
+
+        let settings = MonitorSettings {
+            enabled: true,
+            probe_interval_seconds: 15,
+            probe_timeout_ms: 2000,
+            probe_path: "/models".to_string(),
+        };
+        monitor_tick(&config, &settings).await;
+
+        let after = crate::proxy::read_circuit_state().await;
+        let a = after.providers.get("a").unwrap();
+        let b = after.providers.get("b").unwrap();
+        assert!(
+            a.opened_at.is_none(),
+            "healthy node must be recovered by the monitor even at max backoff"
+        );
+        assert!(b.opened_at.is_some(), "dead node stays open");
+        // 恢复事件只记录真正发生恢复的节点 (本 tick 产生的最后一行: a 恢复, b 保持熔断)。
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let last = log.lines().last().unwrap_or_default();
+        assert!(last.contains("\"provider\":\"a\""), "last recovery event: {last}");
+        assert!(!log.contains("\"provider\":\"b\""));
     }
 
     #[test]
@@ -772,6 +886,7 @@ mod tests {
 
     #[test]
     fn recovery_event_includes_affected_conversations() {
+        let _recovery_guard = RECOVERY_LOG_LOCK.lock().unwrap();
         // 指向测试状态目录, 不污染真实 ~/.pi-switch
         let dir = crate::proxy::init_test_state_dir();
         let path = dir.join("recovery.jsonl");

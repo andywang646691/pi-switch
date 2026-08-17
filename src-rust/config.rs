@@ -234,11 +234,51 @@ impl RuleMatch {
     }
 }
 
+/// How a failover rule picks among its providers, once the circuit breaker has
+/// decided which nodes are currently usable:
+///
+/// - `Stable` (default): providers are ordered by a recent EWMA success score
+///   (healthiest first), and a node that fails again shortly after recovery
+///   ("flapping") has its circuit cooldown escalated (×2 per flap, capped) so
+///   it stays out of rotation longer. The recovery monitor also respects the
+///   backoff exile. This maximizes the upstream success rate at the cost of
+///   not honoring the configured order.
+/// - `Cost`: the configured provider order is tried as-is with a fixed
+///   cooldown, and recovered nodes are re-admitted immediately (original
+///   behavior) — the configured primary is preferred whenever its circuit is
+///   closed, regardless of recent fluctuation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleMode {
+    #[default]
+    Stable,
+    Cost,
+}
+
+impl<'de> Deserialize<'de> for RuleMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "cost" => RuleMode::Cost,
+            // Unknown values fall back to the default (stable) so a typo in a
+            // hand-edited config never fails the whole file to load.
+            _ => RuleMode::Stable,
+        })
+    }
+}
+
+fn rule_mode_is_stable(mode: &RuleMode) -> bool {
+    *mode == RuleMode::Stable
+}
+
 /// A failover rule: when the requested model matches `match`, the gateway tries
 /// the `providers` in order (provider-level granularity — the chain is no longer
 /// limited to profiles exposing the exact same model id). Providers whose
 /// `modelMap` maps the requested model, or that expose it directly, are tried;
 /// others are skipped.
+///
+/// `mode` selects how the chain behaves (see [`RuleMode`]); it defaults to
+/// `stable` when absent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailoverRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,6 +287,10 @@ pub struct FailoverRule {
     pub r#match: RuleMatch,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
+    /// Chain selection mode. Defaults to `stable`; `stable` is also skipped on
+    /// serialization so existing configs round-trip unchanged.
+    #[serde(default, skip_serializing_if = "rule_mode_is_stable")]
+    pub mode: RuleMode,
 }
 
 
@@ -1054,7 +1098,29 @@ pub fn resolve_env(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_provider_wrapper, parse_provider_wrapper, ResponsesMode};
+    use super::{format_provider_wrapper, parse_provider_wrapper, FailoverRule, ResponsesMode, RuleMode};
+    use serde_json::json;
+
+    #[test]
+    fn rule_mode_defaults_to_stable_and_round_trips() {
+        // No `mode` key → Stable (default for hand-written legacy configs).
+        let without: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"] })).unwrap();
+        assert_eq!(without.mode, RuleMode::Stable);
+
+        // Explicit values parse; unknown values fall back to stable instead of
+        // failing the whole config to load.
+        let cost: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "cost" })).unwrap();
+        assert_eq!(cost.mode, RuleMode::Cost);
+        let capped: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "CoSt" })).unwrap();
+        assert_eq!(capped.mode, RuleMode::Cost);
+        let bogus: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "random" })).unwrap();
+        assert_eq!(bogus.mode, RuleMode::Stable);
+
+        // Serialization: stable rules omit `mode` (keeps old configs compact and
+        // round-trip identical); cost rules keep it.
+        assert!(serde_json::to_value(&without).unwrap().get("mode").is_none());
+        assert_eq!(serde_json::to_value(&cost).unwrap()["mode"], json!("cost"));
+    }
 
     #[test]
     fn parses_full_pi_provider_wrapper_without_losing_fields() {

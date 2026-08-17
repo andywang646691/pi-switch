@@ -1,4 +1,4 @@
-use crate::config::{CircuitBreakerSettings, ProviderProfile};
+use crate::config::{CircuitBreakerSettings, ProviderProfile, RuleMode};
 use crate::error::{AppError, Result};
 use axum::{
     body::Body,
@@ -114,6 +114,38 @@ pub struct CircuitEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "affectedConversations")]
     pub affected_conversations: Vec<String>,
+    /// EWMA success score in 0..=1, weighted toward recent outcomes (see
+    /// `SCORE_ALPHA`). Drives stable-mode candidate ordering; providers with no
+    /// history yet start at `DEFAULT_SCORE`.
+    #[serde(default = "default_score", skip_serializing_if = "is_default_score", rename = "score")]
+    pub score: f64,
+    /// Consecutive flap cycles: each recovery followed by a quick re-failure
+    /// increments this (see `open_circuit`); a long healthy stretch resets it.
+    /// Stable mode escalates the circuit cooldown by 2^min(·, BACKOFF_CAP).
+    #[serde(default, skip_serializing_if = "is_zero_u32", rename = "recoveryFailCount")]
+    pub recovery_fail_count: u32,
+    /// When the node last left the open state (successful half-open probe or
+    /// monitor recovery). Only used to detect flapping re-failures.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastRecoveryAt")]
+    pub last_recovery_at: Option<u64>,
+}
+
+impl Default for CircuitEntry {
+    /// New entries start neutral: score 0.5 (same as an absent entry), so the
+    /// first outcome has no pre-existing bias.
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            opened_at: None,
+            last_failure_at: None,
+            last_error: None,
+            last_success_at: None,
+            affected_conversations: Vec::new(),
+            score: DEFAULT_SCORE,
+            recovery_fail_count: 0,
+            last_recovery_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -271,10 +303,62 @@ pub(crate) fn is_node_broken(name: &str, state: &CircuitStateStore) -> bool {
         .unwrap_or(false)
 }
 
+// ─── Stable-mode scoring & backoff ────────────────────────
+
+/// EWMA smoothing factor for per-provider success scores (stable mode). Each
+/// success pulls the score toward 1 by α, each failure toward 0 by (1-α);
+/// recent events dominate while older history decays exponentially.
+const SCORE_ALPHA: f64 = 0.15;
+/// Neutral starting score for providers with no request history yet.
+const DEFAULT_SCORE: f64 = 0.5;
+/// The flap backoff doubles the base cooldown per consecutive flap, capped at
+/// 2^BACKOFF_CAP (32× with the default settings — 32 minutes at 60s cooldown).
+pub(crate) const BACKOFF_CAP: u32 = 5;
+
+fn default_score() -> f64 {
+    DEFAULT_SCORE
+}
+
+fn is_default_score(score: &f64) -> bool {
+    (*score - DEFAULT_SCORE).abs() < f64::EPSILON
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+fn apply_success(score: f64) -> f64 {
+    SCORE_ALPHA + (1.0 - SCORE_ALPHA) * score
+}
+
+fn apply_failure(score: f64) -> f64 {
+    (1.0 - SCORE_ALPHA) * score
+}
+
+/// The circuit cooldown for a node. Stable mode on multi-provider chains
+/// escalates a flapping node's cooldown by 2^recovery_fail_count (see
+/// `open_circuit`), capped at `BACKOFF_CAP` doublings. Cost mode — and
+/// single-provider chains, where there is no alternative node to prefer —
+/// always use the configured cooldown.
+pub(crate) fn cooldown_for_entry(
+    entry: &CircuitEntry,
+    settings: &CircuitBreakerSettings,
+    mode: RuleMode,
+    multi_provider: bool,
+) -> u64 {
+    let base_ms = (settings.cooldown_seconds as u64) * 1000;
+    if mode == RuleMode::Stable && multi_provider {
+        return base_ms.saturating_mul(1u64 << entry.recovery_fail_count.min(BACKOFF_CAP));
+    }
+    base_ms
+}
+
 fn is_circuit_open(
     state: &CircuitStateStore,
     name: &str,
     settings: &CircuitBreakerSettings,
+    mode: RuleMode,
+    multi_provider: bool,
 ) -> (bool, bool) {
     if !settings.enabled {
         return (false, false);
@@ -287,7 +371,7 @@ fn is_circuit_open(
 
     match entry.opened_at {
         Some(opened) => {
-            let cooldown_ms = (settings.cooldown_seconds as u64) * 1000;
+            let cooldown_ms = cooldown_for_entry(entry, settings, mode, multi_provider);
             let now = now_ms();
             let elapsed = now.saturating_sub(opened);
 
@@ -310,6 +394,22 @@ static CIRCUIT_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 // tokio::sync::Mutex 的 guard 跨 await 是设计内的用法 (不阻塞线程),
 // clippy::await_holding_lock 是针对 std 同步锁的 lint, 此处为误报。
+/// Test-only: merge seeding entries into the on-disk circuit state under the
+/// same lock + atomic-write path the runtime uses. Tests must not call
+/// `write_circuit_state` directly — parallel tests' record_* cycles share the
+/// same `circuit.tmp` path, so an unlocked write can clobber a concurrent
+/// temp file mid-cycle, and a wholesale replacement would drop the in-flight
+/// entries other tests are accumulating.
+#[cfg(test)]
+pub(crate) async fn seed_circuit_entries(entries: Vec<(String, CircuitEntry)>) {
+    let _guard = CIRCUIT_STATE_LOCK.lock().await;
+    let mut state = read_circuit_state().await;
+    for (name, entry) in entries {
+        state.providers.insert(name, entry);
+    }
+    write_circuit_state(&state).await;
+}
+
 #[allow(clippy::await_holding_lock)]
 async fn record_success(name: &str, half_open: bool) {
     let _guard = CIRCUIT_STATE_LOCK.lock().await;
@@ -324,14 +424,17 @@ async fn record_success(name: &str, half_open: bool) {
             last_error: None,
             last_success_at: None,
             affected_conversations: Vec::new(),
+            ..Default::default()
         });
 
     entry.failures = 0;
     entry.last_success_at = Some(now_ms());
+    entry.score = apply_success(entry.score);
 
     // If in half-open state and success, transition to closed
     if half_open {
         entry.opened_at = None;
+        entry.last_recovery_at = Some(now_ms());
         // 本次 outage 由一次成功的请求收尾: 不会再有恢复事件, 登记过的
         // 受影响会话一并清空 (否则会残留到下一次故障的恢复事件里)。
         entry.affected_conversations.clear();
@@ -358,6 +461,8 @@ pub(crate) async fn clear_circuit(name: &str) -> (bool, Vec<String>) {
     entry.failures = 0;
     entry.opened_at = None;
     entry.last_success_at = Some(now_ms());
+    entry.last_recovery_at = Some(now_ms());
+    entry.score = apply_success(entry.score);
     let affected = std::mem::take(&mut entry.affected_conversations);
     write_circuit_state(&state).await;
     (was_open, affected)
@@ -436,20 +541,42 @@ async fn record_failure(
             last_error: None,
             last_success_at: None,
             affected_conversations: Vec::new(),
+            ..Default::default()
         });
 
     entry.failures += 1;
     entry.last_failure_at = Some(now_ms());
     entry.last_error = Some(reason.to_string());
+    entry.score = apply_failure(entry.score);
     register_affected_conversation(entry, conversation_id);
 
     // If half-open and failed, immediately reopen
     // If closed and reached threshold, open
     if half_open || entry.failures >= settings.failure_threshold {
-        entry.opened_at = Some(now_ms());
+        open_circuit(entry, settings);
     }
 
     write_circuit_state(&state).await;
+}
+
+/// Open (or re-open) a provider's circuit and track flapping. When the node
+/// recovered recently but fails again quickly (within 3× the base cooldown of
+/// the last recovery), it counts as a flap: `recovery_fail_count` increments
+/// (capped at `BACKOFF_CAP`) and stable mode escalates the next cooldown. A
+/// recovery that held for longer resets the counter — a fresh outage, no
+/// escalation.
+fn open_circuit(entry: &mut CircuitEntry, settings: &CircuitBreakerSettings) {
+    let now = now_ms();
+    let flap_window_ms = (settings.cooldown_seconds as u64) * 3 * 1000;
+    let flapped = entry
+        .last_recovery_at
+        .is_some_and(|t| now.saturating_sub(t) < flap_window_ms);
+    entry.recovery_fail_count = if flapped {
+        entry.recovery_fail_count.saturating_add(1).min(BACKOFF_CAP)
+    } else {
+        0
+    };
+    entry.opened_at = Some(now);
 }
 
 fn now_ms() -> u64 {
@@ -732,7 +859,10 @@ async fn handle_chat_completions(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let mode = route_mode(&config, requested_model);
     let (candidates, real_model) = resolve_route(&config, requested_model);
+    let circuit_state = read_circuit_state().await;
+    let candidates = arrange_candidates(candidates, mode, &circuit_state);
 
     if candidates.is_empty() {
         if let Some(client) = &raw_client {
@@ -765,6 +895,7 @@ async fn handle_chat_completions(
             conversation_id.as_deref(),
             true,
             raw_client.clone(),
+            mode,
         ),
     )
     .await;
@@ -806,6 +937,7 @@ async fn handle_messages(
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let mode = route_mode(&config, requested_model);
     let (candidates, real_model) = resolve_route(&config, requested_model);
 
     // Native Anthropic endpoint: only route to anthropic-messages upstreams.
@@ -833,6 +965,9 @@ async fn handle_messages(
         ).into_response();
     }
 
+    let circuit_state = read_circuit_state().await;
+    let candidates = arrange_candidates(candidates, mode, &circuit_state);
+
     let conversation_id = conversation_id_of(&headers, &body_value);
 
     let result = route_scope(
@@ -845,6 +980,7 @@ async fn handle_messages(
             &headers,
             conversation_id.as_deref(),
             raw_client.clone(),
+            mode,
         ),
     )
     .await;
@@ -1727,7 +1863,10 @@ async fn handle_responses_with_raw(
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let mode = route_mode(config, requested_model);
         let (candidates, real_model) = resolve_route(config, requested_model);
+        let circuit_state = read_circuit_state().await;
+        let candidates = arrange_candidates(candidates, mode, &circuit_state);
         if candidates.is_empty() {
             if let Some(client) = &raw_client {
                 crate::rawlog::append_raw_entry(&crate::rawlog::error_entry(
@@ -1749,6 +1888,7 @@ async fn handle_responses_with_raw(
                 &headers,
                 conversation_id.as_deref(),
                 raw_client.clone(),
+                mode,
             ),
         )
         .await;
@@ -1775,7 +1915,10 @@ async fn handle_responses_with_raw(
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let mode = route_mode(config, requested_model);
         let (candidates, real_model) = resolve_route(config, requested_model);
+        let circuit_state = read_circuit_state().await;
+        let candidates = arrange_candidates(candidates, mode, &circuit_state);
         let conversation_id = conversation_id_of(&headers, &body_value);
         if candidates.is_empty() {
             if let Some(client) = &raw_client {
@@ -1797,6 +1940,7 @@ async fn handle_responses_with_raw(
                 &headers,
                 conversation_id.as_deref(),
                 raw_client.clone(),
+                mode,
             ),
         )
         .await;
@@ -1894,12 +2038,7 @@ fn exposed_profiles(config: &crate::config::PiSwitchConfig) -> Vec<String> {
 /// Splits on the FIRST `/` only, so real ids that themselves contain `/`
 /// (e.g. `openrouter/anthropic/claude-sonnet-4.5`) resolve correctly.
 fn resolve_route(config: &crate::config::PiSwitchConfig, requested: &str) -> (Vec<String>, String) {
-    let real_model = match requested.split_once('/') {
-        Some((prefix, rest)) if is_non_proxy(config, prefix) && exposes(config, prefix, rest) => {
-            rest.to_string()
-        }
-        _ => requested.to_string(),
-    };
+    let real_model = real_model_of(config, requested);
 
     // Rules first: the first matching rule decides the provider chain.
     if let Some(rule) = crate::config::find_rule(config, &real_model) {
@@ -1930,6 +2069,56 @@ fn resolve_route(config: &crate::config::PiSwitchConfig, requested: &str) -> (Ve
         }
     }
     (profiles, requested.to_string())
+}
+
+/// The routing mode for one request's candidate chain. Rules carry their own
+/// `mode`; namespaced and bare-model routing (no rule matched) default to
+/// `stable`.
+fn route_mode(config: &crate::config::PiSwitchConfig, requested: &str) -> RuleMode {
+    crate::config::find_rule(config, &real_model_of(config, requested))
+        .map(|rule| rule.mode)
+        .unwrap_or(RuleMode::Stable)
+}
+
+/// The real model id for a requested id: strip a leading `profile/` namespace
+/// when the profile is a non-proxy upstream that exposes the model.
+fn real_model_of(config: &crate::config::PiSwitchConfig, requested: &str) -> String {
+    match requested.split_once('/') {
+        Some((prefix, rest)) if is_non_proxy(config, prefix) && exposes(config, prefix, rest) => {
+            rest.to_string()
+        }
+        _ => requested.to_string(),
+    }
+}
+
+/// Order a route's candidates for stable mode: highest EWMA success score
+/// first (ties keep the configured order). Cost mode — and single-candidate
+/// chains — return the configured order untouched. Circuit-open nodes are not
+/// filtered here: the forwarding path skips them anyway, and keeping them in
+/// the list preserves the half-open probe slot semantics.
+pub(crate) fn arrange_candidates(
+    candidates: Vec<String>,
+    mode: RuleMode,
+    circuit: &CircuitStateStore,
+) -> Vec<String> {
+    if mode != RuleMode::Stable || candidates.len() <= 1 {
+        return candidates;
+    }
+    let mut ranked: Vec<(f64, usize, String)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (score_of(circuit, &name), i, name))
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    ranked.into_iter().map(|(_, _, name)| name).collect()
+}
+
+fn score_of(circuit: &CircuitStateStore, name: &str) -> f64 {
+    circuit
+        .providers
+        .get(name)
+        .map(|e| e.score)
+        .unwrap_or(DEFAULT_SCORE)
 }
 
 // ─── Request body filtering ───────────────────────────────
@@ -2453,6 +2642,7 @@ async fn log_failed_attempt(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_responses_mixed(
     config: &crate::config::PiSwitchConfig,
     candidates: &[String],
@@ -2461,6 +2651,7 @@ async fn forward_responses_mixed(
     headers: &HeaderMap,
     conversation_id: Option<&str>,
     raw: Option<crate::rawlog::RawClientCapture>,
+    mode: RuleMode,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -2471,7 +2662,8 @@ async fn forward_responses_mixed(
     let mut conversion_error: Option<ResponsesConversionError> = None;
 
     for name in candidates {
-        let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        let (is_open, is_half_open) =
+            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
         route_mark_attempt(name, is_half_open);
         if is_open {
             note_affected(name, conversation_id).await;
@@ -2777,6 +2969,7 @@ async fn forward_responses_mixed(
 /// each by its declared mode: native providers stream through untouched,
 /// Chat Completions providers are translated into Responses SSE events. Failover
 /// may move across modes before any header/event reaches the client.
+#[allow(clippy::too_many_arguments)]
 async fn forward_responses_mixed_stream(
     config: &crate::config::PiSwitchConfig,
     candidates: &[String],
@@ -2785,6 +2978,7 @@ async fn forward_responses_mixed_stream(
     headers: &HeaderMap,
     conversation_id: Option<&str>,
     raw: Option<crate::rawlog::RawClientCapture>,
+    mode: RuleMode,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -2794,7 +2988,8 @@ async fn forward_responses_mixed_stream(
     let mut conversion_error: Option<ResponsesConversionError> = None;
 
     for name in candidates {
-        let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        let (is_open, is_half_open) =
+            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
         route_mark_attempt(name, is_half_open);
         if is_open {
             note_affected(name, conversation_id).await;
@@ -3062,6 +3257,7 @@ async fn forward_with_failover(
     conversation_id: Option<&str>,
     log_stream: bool,
     raw: Option<crate::rawlog::RawClientCapture>,
+    mode: RuleMode,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -3075,7 +3271,8 @@ async fn forward_with_failover(
             None => continue,
         };
 
-        let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        let (is_open, is_half_open) =
+            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
         route_mark_attempt(name, is_half_open);
 
         if is_open {
@@ -3438,6 +3635,7 @@ async fn forward_with_failover(
     Err(AppError::proxy("All upstream attempts failed".to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_anthropic_with_failover(
     config: &crate::config::PiSwitchConfig,
     candidates: &[String],
@@ -3446,6 +3644,7 @@ async fn forward_anthropic_with_failover(
     headers: &HeaderMap,
     conversation_id: Option<&str>,
     raw: Option<crate::rawlog::RawClientCapture>,
+    mode: RuleMode,
 ) -> Result<Response> {
     let conversation_name = conversation_name_of(headers);
     let circuit_settings = &config.settings.proxy.circuit_breaker;
@@ -3454,7 +3653,8 @@ async fn forward_anthropic_with_failover(
     let mut half_open_used = false;
 
     for name in candidates {
-        let (is_open, is_half_open) = is_circuit_open(&circuit_state, name, circuit_settings);
+        let (is_open, is_half_open) =
+            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
         route_mark_attempt(name, is_half_open);
 
         if is_open {
@@ -3832,10 +4032,11 @@ async fn log_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_log_line, filter_private_params, handle_responses_with_config, make_router,
-        normalize_developer_role, resolve_route, ProxyState, REQUEST_LOG_RETENTION_DAYS,
+        append_log_line, arrange_candidates, cooldown_for_entry, filter_private_params,
+        handle_responses_with_config, make_router, normalize_developer_role, resolve_route,
+        route_mode, CircuitEntry, CircuitStateStore, ProxyState, REQUEST_LOG_RETENTION_DAYS,
     };
-    use crate::config::PiSwitchConfig;
+    use crate::config::{PiSwitchConfig, RuleMode};
     use axum::{
         body::{to_bytes, Body},
         http::{HeaderMap, HeaderValue, Request, StatusCode},
@@ -3884,6 +4085,18 @@ mod tests {
         c
     }
 
+    /// Cost-mode variant of [`rule`]: keeps the configured provider order
+    /// deterministic for handler tests that assert per-attempt details (the
+    /// working tree's stable-mode ordering would otherwise depend on the
+    /// shared, parallel test state).
+    fn rule_cost(prefix: &str, providers: &[&str]) -> crate::config::FailoverRule {
+        let mut r = rule(prefix, providers);
+        r.mode = crate::config::RuleMode::Cost;
+        r
+    }
+
+
+
     fn rule(prefix: &str, providers: &[&str]) -> crate::config::FailoverRule {
         crate::config::FailoverRule {
             name: None,
@@ -3892,6 +4105,7 @@ mod tests {
                 model_contains: None,
             },
             providers: providers.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -3997,6 +4211,348 @@ mod tests {
         assert!(!affected.contains(&"sess-0".to_string()));
         assert!(affected.contains(&"sess-67".to_string()));
     }
+
+    #[test]
+    fn stable_mode_orders_candidates_by_ewma_score_desc() {
+        let mut circuit = CircuitStateStore::default();
+        circuit.providers.insert(
+            "low".into(),
+            CircuitEntry {
+                failures: 3,
+                opened_at: None,
+                last_failure_at: Some(100),
+                last_error: Some("HTTP 503".into()),
+                last_success_at: Some(200),
+                affected_conversations: vec![],
+                score: 0.31,
+                ..Default::default()
+            },
+        );
+        circuit.providers.insert(
+            "high".into(),
+            CircuitEntry {
+                failures: 0,
+                opened_at: None,
+                last_failure_at: None,
+                last_error: None,
+                last_success_at: Some(300),
+                affected_conversations: vec![],
+                score: 0.93,
+                ..Default::default()
+            },
+        );
+        // Circuit-open nodes stay in the list (the forwarding path skips them;
+        // their position only decides the half-open probe slot).
+        circuit.providers.insert(
+            "open".into(),
+            CircuitEntry {
+                failures: 3,
+                opened_at: Some(100),
+                ..Default::default()
+            },
+        );
+
+        let ordered = arrange_candidates(
+            vec!["low".into(), "open".into(), "high".into()],
+            RuleMode::Stable,
+            &circuit,
+        );
+        // Unknown-score nodes sit at 0.5 (neutral): high(0.93) > open(0.5) > low(0.31).
+        assert_eq!(ordered, vec!["high", "open", "low"]);
+
+        // Cost mode keeps the configured order untouched.
+        let cost_ordered = arrange_candidates(
+            vec!["low".into(), "open".into(), "high".into()],
+            RuleMode::Cost,
+            &circuit,
+        );
+        assert_eq!(cost_ordered, vec!["low", "open", "high"]);
+
+        // Single-candidate chains are returned as-is (no reordering).
+        let single = arrange_candidates(vec!["low".into()], RuleMode::Stable, &circuit);
+        assert_eq!(single, vec!["low"]);
+
+        // Unknown providers score 0.5 (neutral) and ties keep configured order.
+        let mixed = arrange_candidates(
+            vec!["fresh".into(), "high".into()],
+            RuleMode::Stable,
+            &circuit,
+        );
+        assert_eq!(mixed, vec!["high", "fresh"]);
+    }
+
+    #[test]
+    fn stable_mode_escalates_cooldown_for_flapping_nodes() {
+        let settings = crate::config::CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 3,
+            cooldown_seconds: 60,
+        };
+
+        let fresh = CircuitEntry {
+            recovery_fail_count: 0,
+            ..Default::default()
+        };
+        assert_eq!(cooldown_for_entry(&fresh, &settings, RuleMode::Stable, true), 60_000);
+        // Cost mode never escalates.
+        let flappy = CircuitEntry {
+            recovery_fail_count: 3,
+            ..Default::default()
+        };
+        assert_eq!(cooldown_for_entry(&flappy, &settings, RuleMode::Stable, true), 480_000);
+        assert_eq!(cooldown_for_entry(&flappy, &settings, RuleMode::Cost, true), 60_000);
+        // Single-provider chains never escalate either.
+        assert_eq!(cooldown_for_entry(&flappy, &settings, RuleMode::Stable, false), 60_000);
+        // Capped at 2^BACKOFF_CAP doublings.
+        let capped = CircuitEntry {
+            recovery_fail_count: 99,
+            ..Default::default()
+        };
+        assert_eq!(cooldown_for_entry(&capped, &settings, RuleMode::Stable, true), 60_000 * 32);
+    }
+
+    #[tokio::test]
+    async fn flap_counter_escalates_on_quick_refailure_but_resets_after_healthy_stretch() {
+        let settings = crate::config::CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 3,
+            cooldown_seconds: 60,
+        };
+        // Fresh node: first outage opens the circuit with no escalation.
+        for _ in 0..3 {
+            super::record_failure("flap-a", &settings, "HTTP 503", false, None).await;
+        }
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("flap-a").unwrap();
+        assert_eq!(a.recovery_fail_count, 0);
+        assert!(a.opened_at.is_some());
+
+        // Node recovers via half-open probe, then fails again right away: flap.
+        super::record_success("flap-a", true).await;
+        for _ in 0..3 {
+            super::record_failure("flap-a", &settings, "HTTP 503", false, None).await;
+        }
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("flap-a").unwrap();
+        assert_eq!(a.recovery_fail_count, 1);
+
+        // A second quick flap escalates again.
+        super::record_success("flap-a", true).await;
+        for _ in 0..3 {
+            super::record_failure("flap-a", &settings, "HTTP 503", false, None).await;
+        }
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("flap-a").unwrap();
+        assert_eq!(a.recovery_fail_count, 2);
+
+        // Successes keep the score moving up; the score is shared state even
+        // across modes.
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("flap-a").unwrap();
+        let score = a.score;
+        assert!(score > 0.0 && score < 1.0);
+    }
+
+    #[tokio::test]
+    async fn ewma_score_moves_with_outcomes_and_recovers_through_clear_circuit() {
+        let settings = crate::config::CircuitBreakerSettings {
+            enabled: true,
+            failure_threshold: 100,
+            cooldown_seconds: 60,
+        };
+        // 4 failures drop the score well below the 0.5 neutral start.
+        for _ in 0..4 {
+            super::record_failure("score-a", &settings, "HTTP 503", false, None).await;
+        }
+        let score_after_failures = {
+            let state = super::read_circuit_state().await;
+            state.providers.get("score-a").unwrap().score
+        };
+        assert!(score_after_failures < 0.5);
+
+        // Successes pull it back toward 1.
+        for _ in 0..6 {
+            super::record_success("score-a", false).await;
+        }
+        let state = super::read_circuit_state().await;
+        let score = state.providers.get("score-a").unwrap().score;
+        assert!(score > 0.5);
+        assert!(score > score_after_failures);
+        assert!(score <= 1.0);
+
+        // A monitor/clear-circuit recovery also counts as a success.
+        super::clear_circuit("score-a").await;
+        let state = super::read_circuit_state().await;
+        let a = state.providers.get("score-a").unwrap();
+        assert!(a.score > score);
+        assert!(a.last_recovery_at.is_some());
+    }
+
+    #[test]
+    fn route_mode_comes_from_the_matching_rule_and_defaults_to_stable() {
+        let c = cfg(
+            serde_json::json!({
+                "a": { "proxy": false, "exposedModels": ["gpt-5.4"] },
+                "b": { "proxy": false, "exposedModels": ["gpt-5.4"] },
+            }),
+            vec![crate::config::FailoverRule {
+                name: Some("cost-chain".into()),
+                r#match: crate::config::RuleMatch {
+                    model_prefix: Some("gpt-".into()),
+                    model_contains: None,
+                },
+                providers: vec!["a".into()],
+                mode: RuleMode::Cost,
+            }],
+        );
+        assert_eq!(route_mode(&c, "gpt-5.4"), RuleMode::Cost);
+        // The matching rule also wins over explicit namespacing.
+        assert_eq!(route_mode(&c, "a/gpt-5.4"), RuleMode::Cost);
+        // No rule matched → stable default.
+        assert_eq!(route_mode(&c, "something-else"), RuleMode::Stable);
+    }
+
+    #[tokio::test]
+    async fn stable_mode_routes_handler_to_highest_score_node_while_cost_keeps_order() {
+        // Two healthy upstreams; A has a degraded score (past failures) while B
+        // has been reliable. Stable mode must try B first despite A being
+        // configured first; cost mode must try A first.
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let server_a = tokio::spawn(async move {
+            axum::serve(
+                listener_a,
+                Router::new().route(
+                    "/v1/responses",
+                    post(async || {
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "id": "resp-a", "object": "response", "model": "model-a",
+                                    "output": [],
+                                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap()
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let hit_b = Arc::new(Mutex::new(false));
+        let hit_b_for_server = hit_b.clone();
+        let server_b = tokio::spawn(async move {
+            axum::serve(
+                listener_b,
+                Router::new().route(
+                    "/v1/responses",
+                    post(async move || {
+                        *hit_b_for_server.lock().unwrap() = true;
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "id": "resp-b", "object": "response", "model": "model-a",
+                                    "output": [],
+                                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap()
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Pre-seed circuit state: A degraded (score 0.2), B reliable (0.8).
+        let mut circuit = CircuitStateStore::default();
+        circuit.providers.insert(
+            "a".into(),
+            CircuitEntry {
+                failures: 0,
+                opened_at: None,
+                last_failure_at: Some(1),
+                last_error: Some("HTTP 503".into()),
+                last_success_at: Some(2),
+                affected_conversations: vec![],
+                score: 0.2,
+                ..Default::default()
+            },
+        );
+        circuit.providers.insert(
+            "b".into(),
+            CircuitEntry {
+                failures: 0,
+                opened_at: None,
+                last_failure_at: None,
+                last_error: None,
+                last_success_at: Some(2),
+                affected_conversations: vec![],
+                score: 0.8,
+                ..Default::default()
+            },
+        );
+        super::seed_circuit_entries(vec![
+            ("a".into(), circuit.providers.remove("a").unwrap()),
+            ("b".into(), circuit.providers.remove("b").unwrap()),
+        ])
+        .await;
+
+        let config = cfg(
+            serde_json::json!({
+                "a": {
+                    "api": "openai-responses",
+                    "responsesMode": "passthrough",
+                    "baseUrl": format!("http://{}/v1", addr_a),
+                    "apiKey": "key",
+                    "exposedModels": ["model-a"]
+                },
+                "b": {
+                    "api": "openai-responses",
+                    "responsesMode": "passthrough",
+                    "baseUrl": format!("http://{}/v1", addr_b),
+                    "apiKey": "key",
+                    "exposedModels": ["model-a"]
+                }
+            }),
+            vec![rule("model-a", &["a", "b"])],
+        );
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({ "model": "model-a", "input": "hi" }).to_string();
+
+        // Stable (default): B (score 0.8) tried first, A never contacted.
+        let resp = handle_responses_with_config(&config, headers.clone(), body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        if !*hit_b.lock().unwrap() {
+            let after = super::read_circuit_state().await;
+            let msg = format!(
+                "stable mode must try the healthier node first; circuit: {:?}",
+                after.providers.keys().collect::<Vec<_>>()
+            );
+            panic!("{msg}");
+        }
+
+        // Cost: configured order [a, b] wins — but a's circuit is closed here,
+        // so A answers and B must NOT be contacted again.
+        let mut cost_config = config.clone();
+        cost_config.settings.proxy.rules = vec![rule_cost("model-a", &["a", "b"])];
+        let resp = handle_responses_with_config(&cost_config, headers, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(super::read_circuit_state().await.providers.contains_key("a"));
+
+        server_a.abort();
+        server_b.abort();
+    }
+
     #[tokio::test]
     async fn native_responses_non_streaming_preserves_body_and_response() {
         let seen = Arc::new(Mutex::new(None::<String>));
@@ -4331,7 +4887,8 @@ mod tests {
 
     #[tokio::test]
     async fn responses_mixed_failover_non_streaming_convert_then_native() {
-        // Primary candidate is a convert (openai-completions) profile that fails
+        // Primary candidate is a convert
+        // (openai-completions) profile that fails
         // retryably; the failover chain carries a native (openai-responses)
         // candidate. The request must fail over across modes.
         let chat_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4390,7 +4947,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["chat", "native"])],
+            vec![rule_cost("model-a", &["chat", "native"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -4463,7 +5020,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["native", "chat"])],
+            vec![rule_cost("model-a", &["native", "chat"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -4620,7 +5177,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["fail", "ok"])],
+            vec![rule_cost("model-a", &["fail", "ok"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -4704,7 +5261,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["broken", "backup"])],
+            vec![rule_cost("model-a", &["broken", "backup"])],
         );
 
         let response = handle_responses_with_config(
@@ -4973,7 +5530,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["chat", "native"])],
+            vec![rule_cost("model-a", &["chat", "native"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -5049,7 +5606,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["native", "chat"])],
+            vec![rule_cost("model-a", &["native", "chat"])],
         );
         let response = handle_responses_with_config(
             &config,
@@ -5192,7 +5749,8 @@ mod tests {
 
     #[tokio::test]
     async fn responses_mixed_failover_logs_both_attempts() {
-        // Mixed chain (convert 503 then native 200) must leave both a failed
+        // Mixed chain
+        // (convert 503 then native 200) must leave both a failed
         // attempt and a successful entry in the request log.
         let chat_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let chat_address = chat_listener.local_addr().unwrap();
@@ -5247,7 +5805,7 @@ mod tests {
                     "exposedModels": ["model-a"]
                 }
             }),
-            vec![rule("model-a", &["chat", "native"])],
+            vec![rule_cost("model-a", &["chat", "native"])],
         );
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -5576,6 +6134,7 @@ mod tests {
                     model_contains: None,
                 },
                 providers: vec!["fox".into(), "hyb".into()],
+                ..Default::default()
             }],
         );
         let (profiles, real) = resolve_route(&c, "hyb/gpt-5.4");
@@ -5596,6 +6155,7 @@ mod tests {
                     model_contains: Some("deepseek".into()),
                 },
                 providers: vec!["ds".into()],
+                ..Default::default()
             }],
         );
         let (profiles, real) = resolve_route(&c, "deepseek-v4-pro");
@@ -5617,6 +6177,7 @@ mod tests {
                     model_contains: None,
                 },
                 providers: vec!["ghost".into(), "gw".into(), "a".into()],
+                ..Default::default()
             }],
         );
         let (profiles, _real) = resolve_route(&c, "gpt-5.4");
@@ -5638,6 +6199,7 @@ mod tests {
                         model_contains: None,
                     },
                     providers: vec!["a".into()],
+                    ..Default::default()
                 },
                 crate::config::FailoverRule {
                     name: Some("gpt5-chain".into()),
@@ -5646,6 +6208,7 @@ mod tests {
                         model_contains: None,
                     },
                     providers: vec!["b".into()],
+                    ..Default::default()
                 },
             ],
         );
@@ -6571,6 +7134,7 @@ mod tests {
             None,
             true,
             raw,
+            RuleMode::Stable,
         )
         .await
         .expect("upstream succeeds");
@@ -6981,6 +7545,7 @@ mod tests {
             None,
             true,
             None,
+            RuleMode::Stable,
         )
         .await
         .expect("upstream succeeds");
