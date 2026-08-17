@@ -4,9 +4,12 @@
  * 职责单一: 内核 (Rust 代理进程) 负责监测上游熔断、探测恢复、让节点退出熔断,
  * 并把每次节点恢复追加为一行 JSON 到 ~/.pi-switch/recovery.jsonl (事件携带
  * 故障期间失败过的会话 id)。
- * 本扩展只做一件事: 轮询该文件, 发现与本会话相关的新恢复事件后以 user 身份
- * 向 pi 发送一条 "continue" 消息, 让 pi 重试被中断的任务。其他 agent 造成的
- * 故障 (事件里没有本会话 id) 不会触发 continue; 多个 pi 实例也互不打扰。
+ * 本扩展只做一件事: 轮询该文件, 发现与本会话相关的新恢复事件后,**检查 agent
+ * 是否已把控制权交还给用户** (会话空闲、LLM 不在输出、无排队消息、输入框可用),
+ * 只有确认用户可输入时, 才以 user 身份向 pi 发送一条 "continue" 消息让 pi
+ * 重试被中断的任务。若 agent 仍在工作, 事件挂起、下一轮再查, 绝不把 continue
+ * 排到当前输出结束后投递 (那会在 agent 刚交还控制权时抢走输入)。其他 agent
+ * 造成的故障 (事件里没有本会话 id) 不会触发 continue; 多个 pi 实例也互不打扰。
  *
  * 无 slash 命令、无配置文件、不触碰 circuit.json。
  *
@@ -14,6 +17,47 @@
  *  - 每 3s 读一次小文件, I/O/CPU 可忽略; 定时器 unref, 不阻止进程退出。
  *  - subagent / Magic Context 后台进程不加载轮询逻辑 (各自会话无关)。
  */
+
+/** 会话分支条目里与「用户是否已继续会话」判断相关的字段。 */
+export type BranchStateEntry = {
+  type: string;
+  timestamp: string;
+  message?: { role?: string };
+};
+
+/**
+ * 判断 agent 是否已把控制权交还给用户:
+ *  - ctx.isIdle(): 会话空闲 —— 没有运行中的 agent run / 自动重试 / 自动压缩
+ *    重试 / 排队续跑; LLM 输出中 (streaming) 也属于 agent run, 视为未交还;
+ *  - !ctx.hasPendingMessages(): 没有排队等待投递的 steer/followUp 消息,
+ *    否则会话马上会自行继续, 再发 continue 只会重复打扰;
+ * 拿不到上下文时一律视为未交还 (安全侧: 宁可不下发, 不打扰用户)。
+ */
+export function userHasControl(
+  ctx: { isIdle(): boolean; hasPendingMessages(): boolean } | undefined,
+): boolean {
+  if (!ctx) return false;
+  return ctx.isIdle() && !ctx.hasPendingMessages();
+}
+
+/**
+ * 分支中是否存在时间戳晚于 afterTs 的用户消息 (即故障之后用户已亲自继续了会话)。
+ * 从分支尾部往前找最后一条 user 消息: 它晚于 afterTs 则返回 true;
+ * 不晚于 (或无法解析) 则其之前不可能再有更新的用户消息, 返回 false。
+ */
+export function hasUserMessageAfter(
+  branch: readonly BranchStateEntry[],
+  afterTs: number,
+): boolean {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== "message" || entry.message?.role !== "user") continue;
+    const ts = Date.parse(entry.timestamp);
+    if (!Number.isFinite(ts)) return false;
+    return ts > afterTs;
+  }
+  return false;
+}
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
@@ -144,17 +188,28 @@ export default function failoverWatchdogExtension(pi: ExtensionAPI): void {
       cursorTs = latestEventTs(events);
       return;
     }
+    const recoveryTs = latestEventTs(mine);
+
+    // 故障之后用户是否已经发出新消息 (用户手动重试了任务, 或另一个扩展接管了
+    // 输入并把消息写成了 user 角色): 会话已经自行继续, 恢复信号已过期,
+    // 直接消费事件, 不发送 continue, 避免打扰用户正在进行的对话。
+    if (latestCtx && hasUserMessageAfter(latestCtx.sessionManager.getBranch(), recoveryTs)) {
+      cursorTs = recoveryTs;
+      return;
+    }
+
+    // 只在 agent 把控制权交还给用户时才发送 continue (见 userHasControl):
+    // 会话空闲 + 无排队消息 + 用户可输入。忙时事件挂起、下一轮再查 ——
+    // 绝不把 continue 排到当前输出结束后投递。
+    if (!userHasControl(latestCtx)) return;
 
     sending = true;
     try {
-      if (latestCtx?.isIdle()) {
-        await pi.sendUserMessage(CONTINUE_MESSAGE);
-      } else {
-        await pi.sendUserMessage(CONTINUE_MESSAGE, { deliverAs: "followUp" });
-      }
+      // 此时已确认空闲: 普通发送立即触发新一轮, 无需 deliverAs。
+      await pi.sendUserMessage(CONTINUE_MESSAGE);
       // 同一轮内多个节点恢复合并为一条 continue; 发送成功才推进游标,
       // 失败则下一轮重试 (事件不会丢失)。
-      cursorTs = latestEventTs(events);
+      cursorTs = recoveryTs;
     } catch {
       // 发送失败: 游标不动, 下一轮重试
     } finally {

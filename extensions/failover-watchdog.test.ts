@@ -6,6 +6,8 @@ import {
   latestEventTs,
   eventsForConversation,
   isForkedProcess,
+  userHasControl,
+  hasUserMessageAfter,
   CONTINUE_MESSAGE,
   POLL_INTERVAL_MS,
 } from "./failover-watchdog.ts";
@@ -116,6 +118,60 @@ test("eventsForConversation only matches events naming this session", () => {
 test("eventsForConversation handles blank session id", () => {
   const mine = { ts: 1, provider: "a", conversations: ["sess-pi"] };
   assert.deepEqual(eventsForConversation([mine], ""), []);
+});
+
+test("userHasControl gates on idle and no pending messages", () => {
+  const idle = { isIdle: () => true, hasPendingMessages: () => false };
+  const busy = { isIdle: () => false, hasPendingMessages: () => false };
+  const pending = { isIdle: () => true, hasPendingMessages: () => true };
+  const busyPending = { isIdle: () => false, hasPendingMessages: () => true };
+
+  assert.equal(userHasControl(idle), true);
+  assert.equal(userHasControl(busy), false); // agent 仍在工作 / LLM 输出中
+  assert.equal(userHasControl(pending), false); // 有排队消息, 会话会自行继续
+  assert.equal(userHasControl(busyPending), false);
+  assert.equal(userHasControl(undefined), false); // 拿不到上下文: 安全侧, 不发
+});
+
+test("hasUserMessageAfter detects user taking over after a recovery event", () => {
+  const before = "2026-01-01T00:00:00.000Z"; // ts = 1767225600000
+  const after = "2026-01-01T00:00:05.000Z"; // ts = 1767225605000
+  const userAfter = {
+    type: "message",
+    timestamp: after,
+    message: { role: "user" },
+  };
+  const userBefore = {
+    type: "message",
+    timestamp: before,
+    message: { role: "user" },
+  };
+  const assistantAfter = {
+    type: "message",
+    timestamp: after,
+    message: { role: "assistant" },
+  };
+  const customAfter = { type: "custom", timestamp: after, customType: "x" };
+
+  // 故障 (ts=1767225603000) 之后用户发了新消息 → 信号过期
+  assert.equal(hasUserMessageAfter([userBefore, userAfter], 1767225603000), true);
+  // 最后一条用户消息在故障之前 → 未接手
+  assert.equal(hasUserMessageAfter([userBefore, assistantAfter], 1767225603000), false);
+  // 故障之后只有 assistant 输出 / custom 条目 → 未接手
+  assert.equal(hasUserMessageAfter([userBefore, assistantAfter, customAfter], 1767225603000), false);
+  // 空分支
+  assert.equal(hasUserMessageAfter([], 1767225603000), false);
+  // 全无 user 消息
+  assert.equal(hasUserMessageAfter([assistantAfter, customAfter], 1767225603000), false);
+});
+
+test("hasUserMessageAfter treats equal/unparseable timestamps as not-after", () => {
+  const equalTs = "2026-01-01T00:00:03.000Z"; // 恰等于事件 ts
+  const userEqual = { type: "message", timestamp: equalTs, message: { role: "user" } };
+  const userBad = { type: "message", timestamp: "not-a-date", message: { role: "user" } };
+
+  assert.equal(hasUserMessageAfter([userEqual], 1767225603000), false);
+  assert.equal(hasUserMessageAfter([userBad], 1767225603000), false);
 });
 
 test("extension constants are the documented values", () => {
