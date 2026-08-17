@@ -117,16 +117,28 @@ pub struct CircuitEntry {
     /// EWMA success score in 0..=1, weighted toward recent outcomes (see
     /// `SCORE_ALPHA`). Drives stable-mode candidate ordering; providers with no
     /// history yet start at `DEFAULT_SCORE`.
-    #[serde(default = "default_score", skip_serializing_if = "is_default_score", rename = "score")]
+    #[serde(
+        default = "default_score",
+        skip_serializing_if = "is_default_score",
+        rename = "score"
+    )]
     pub score: f64,
     /// Consecutive flap cycles: each recovery followed by a quick re-failure
     /// increments this (see `open_circuit`); a long healthy stretch resets it.
     /// Stable mode escalates the circuit cooldown by 2^min(·, BACKOFF_CAP).
-    #[serde(default, skip_serializing_if = "is_zero_u32", rename = "recoveryFailCount")]
+    #[serde(
+        default,
+        skip_serializing_if = "is_zero_u32",
+        rename = "recoveryFailCount"
+    )]
     pub recovery_fail_count: u32,
     /// When the node last left the open state (successful half-open probe or
     /// monitor recovery). Only used to detect flapping re-failures.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "lastRecoveryAt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lastRecoveryAt"
+    )]
     pub last_recovery_at: Option<u64>,
 }
 
@@ -2662,8 +2674,13 @@ async fn forward_responses_mixed(
     let mut conversion_error: Option<ResponsesConversionError> = None;
 
     for name in candidates {
-        let (is_open, is_half_open) =
-            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
+        let (is_open, is_half_open) = is_circuit_open(
+            &circuit_state,
+            name,
+            circuit_settings,
+            mode,
+            candidates.len() > 1,
+        );
         route_mark_attempt(name, is_half_open);
         if is_open {
             note_affected(name, conversation_id).await;
@@ -2988,8 +3005,13 @@ async fn forward_responses_mixed_stream(
     let mut conversion_error: Option<ResponsesConversionError> = None;
 
     for name in candidates {
-        let (is_open, is_half_open) =
-            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
+        let (is_open, is_half_open) = is_circuit_open(
+            &circuit_state,
+            name,
+            circuit_settings,
+            mode,
+            candidates.len() > 1,
+        );
         route_mark_attempt(name, is_half_open);
         if is_open {
             note_affected(name, conversation_id).await;
@@ -3271,8 +3293,13 @@ async fn forward_with_failover(
             None => continue,
         };
 
-        let (is_open, is_half_open) =
-            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
+        let (is_open, is_half_open) = is_circuit_open(
+            &circuit_state,
+            name,
+            circuit_settings,
+            mode,
+            candidates.len() > 1,
+        );
         route_mark_attempt(name, is_half_open);
 
         if is_open {
@@ -3653,8 +3680,13 @@ async fn forward_anthropic_with_failover(
     let mut half_open_used = false;
 
     for name in candidates {
-        let (is_open, is_half_open) =
-            is_circuit_open(&circuit_state, name, circuit_settings, mode, candidates.len() > 1);
+        let (is_open, is_half_open) = is_circuit_open(
+            &circuit_state,
+            name,
+            circuit_settings,
+            mode,
+            candidates.len() > 1,
+        );
         route_mark_attempt(name, is_half_open);
 
         if is_open {
@@ -4095,8 +4127,6 @@ mod tests {
         r
     }
 
-
-
     fn rule(prefix: &str, providers: &[&str]) -> crate::config::FailoverRule {
         crate::config::FailoverRule {
             name: None,
@@ -4293,22 +4323,37 @@ mod tests {
             recovery_fail_count: 0,
             ..Default::default()
         };
-        assert_eq!(cooldown_for_entry(&fresh, &settings, RuleMode::Stable, true), 60_000);
+        assert_eq!(
+            cooldown_for_entry(&fresh, &settings, RuleMode::Stable, true),
+            60_000
+        );
         // Cost mode never escalates.
         let flappy = CircuitEntry {
             recovery_fail_count: 3,
             ..Default::default()
         };
-        assert_eq!(cooldown_for_entry(&flappy, &settings, RuleMode::Stable, true), 480_000);
-        assert_eq!(cooldown_for_entry(&flappy, &settings, RuleMode::Cost, true), 60_000);
+        assert_eq!(
+            cooldown_for_entry(&flappy, &settings, RuleMode::Stable, true),
+            480_000
+        );
+        assert_eq!(
+            cooldown_for_entry(&flappy, &settings, RuleMode::Cost, true),
+            60_000
+        );
         // Single-provider chains never escalate either.
-        assert_eq!(cooldown_for_entry(&flappy, &settings, RuleMode::Stable, false), 60_000);
+        assert_eq!(
+            cooldown_for_entry(&flappy, &settings, RuleMode::Stable, false),
+            60_000
+        );
         // Capped at 2^BACKOFF_CAP doublings.
         let capped = CircuitEntry {
             recovery_fail_count: 99,
             ..Default::default()
         };
-        assert_eq!(cooldown_for_entry(&capped, &settings, RuleMode::Stable, true), 60_000 * 32);
+        assert_eq!(
+            cooldown_for_entry(&capped, &settings, RuleMode::Stable, true),
+            60_000 * 32
+        );
     }
 
     #[tokio::test]
@@ -4547,7 +4592,10 @@ mod tests {
         cost_config.settings.proxy.rules = vec![rule_cost("model-a", &["a", "b"])];
         let resp = handle_responses_with_config(&cost_config, headers, body).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(super::read_circuit_state().await.providers.contains_key("a"));
+        assert!(super::read_circuit_state()
+            .await
+            .providers
+            .contains_key("a"));
 
         server_a.abort();
         server_b.abort();

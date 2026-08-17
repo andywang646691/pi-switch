@@ -202,9 +202,17 @@ impl Default for MonitorSettings {
 /// meaningful; conditions are ANDed when several are present.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuleMatch {
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "modelPrefix")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "modelPrefix"
+    )]
     pub model_prefix: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "modelContains")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "modelContains"
+    )]
     pub model_contains: Option<String>,
 }
 
@@ -292,7 +300,6 @@ pub struct FailoverRule {
     #[serde(default, skip_serializing_if = "rule_mode_is_stable")]
     pub mode: RuleMode,
 }
-
 
 /// The first rule whose match conditions hit `model`, if any. Rules are evaluated
 /// in configured order; the first hit wins.
@@ -1098,27 +1105,44 @@ pub fn resolve_env(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_provider_wrapper, parse_provider_wrapper, FailoverRule, ResponsesMode, RuleMode};
+    use super::{
+        format_provider_wrapper, parse_provider_wrapper, FailoverRule, ResponsesMode, RuleMode,
+    };
     use serde_json::json;
 
     #[test]
     fn rule_mode_defaults_to_stable_and_round_trips() {
         // No `mode` key → Stable (default for hand-written legacy configs).
-        let without: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"] })).unwrap();
+        let without: FailoverRule = serde_json::from_value(
+            json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"] }),
+        )
+        .unwrap();
         assert_eq!(without.mode, RuleMode::Stable);
 
         // Explicit values parse; unknown values fall back to stable instead of
         // failing the whole config to load.
-        let cost: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "cost" })).unwrap();
+        let cost: FailoverRule = serde_json::from_value(
+            json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "cost" }),
+        )
+        .unwrap();
         assert_eq!(cost.mode, RuleMode::Cost);
-        let capped: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "CoSt" })).unwrap();
+        let capped: FailoverRule = serde_json::from_value(
+            json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "CoSt" }),
+        )
+        .unwrap();
         assert_eq!(capped.mode, RuleMode::Cost);
-        let bogus: FailoverRule = serde_json::from_value(json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "random" })).unwrap();
+        let bogus: FailoverRule = serde_json::from_value(
+            json!({ "match": { "modelPrefix": "gpt-" }, "providers": ["a"], "mode": "random" }),
+        )
+        .unwrap();
         assert_eq!(bogus.mode, RuleMode::Stable);
 
         // Serialization: stable rules omit `mode` (keeps old configs compact and
         // round-trip identical); cost rules keep it.
-        assert!(serde_json::to_value(&without).unwrap().get("mode").is_none());
+        assert!(serde_json::to_value(&without)
+            .unwrap()
+            .get("mode")
+            .is_none());
         assert_eq!(serde_json::to_value(&cost).unwrap()["mode"], json!("cost"));
     }
 

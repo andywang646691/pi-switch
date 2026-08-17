@@ -1020,8 +1020,22 @@ pub(super) fn render_rules_editor(frame: &mut Frame<'_>, app: &App, area: Rect) 
         ("↑↓", i18n::key_move()),
         ("Ctrl+j/k", if i18n::is_zh() { "移动" } else { "Move" }),
         ("n", if i18n::is_zh() { "名称" } else { "Name" }),
-        ("e", if i18n::is_zh() { "匹配条件" } else { "Match" }),
-        ("p", if i18n::is_zh() { "供应商链" } else { "Providers" }),
+        (
+            "e",
+            if i18n::is_zh() {
+                "匹配条件"
+            } else {
+                "Match"
+            },
+        ),
+        (
+            "p",
+            if i18n::is_zh() {
+                "供应商链"
+            } else {
+                "Providers"
+            },
+        ),
         ("m", if i18n::is_zh() { "模式" } else { "Mode" }),
         ("i", if i18n::is_zh() { "新增" } else { "Insert" }),
         ("d", if i18n::is_zh() { "删除" } else { "Delete" }),

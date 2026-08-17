@@ -1276,19 +1276,17 @@ impl App {
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.rules_editor.idx > 0 {
-                    self.rules_editor.rules.swap(
-                        self.rules_editor.idx,
-                        self.rules_editor.idx - 1,
-                    );
+                    self.rules_editor
+                        .rules
+                        .swap(self.rules_editor.idx, self.rules_editor.idx - 1);
                     self.rules_editor.idx -= 1;
                 }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.rules_editor.idx < len - 1 {
-                    self.rules_editor.rules.swap(
-                        self.rules_editor.idx,
-                        self.rules_editor.idx + 1,
-                    );
+                    self.rules_editor
+                        .rules
+                        .swap(self.rules_editor.idx, self.rules_editor.idx + 1);
                     self.rules_editor.idx += 1;
                 }
             }
@@ -1306,10 +1304,8 @@ impl App {
             KeyCode::Char('d') => {
                 self.rules_editor.rules.remove(self.rules_editor.idx);
                 if !self.rules_editor.rules.is_empty() {
-                    self.rules_editor.idx = self
-                        .rules_editor
-                        .idx
-                        .min(self.rules_editor.rules.len() - 1);
+                    self.rules_editor.idx =
+                        self.rules_editor.idx.min(self.rules_editor.rules.len() - 1);
                 }
             }
             KeyCode::Char('n') => {
@@ -1338,8 +1334,7 @@ impl App {
             }
             KeyCode::Char('p') => {
                 // Edit provider chain
-                self.rules_editor.providers =
-                    self.rules_provider_checklist(self.rules_editor.idx);
+                self.rules_editor.providers = self.rules_provider_checklist(self.rules_editor.idx);
                 self.rules_editor.provider_idx = 0;
                 self.rules_editor.mode = RulesEditMode::Providers;
             }
@@ -1360,16 +1355,13 @@ impl App {
             KeyCode::Esc => {
                 self.rules_editor.mode = RulesEditMode::List;
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Up | KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.rules_editor.provider_idx = self.rules_editor.provider_idx.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j')
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.rules_editor.provider_idx =
-                    (self.rules_editor.provider_idx + 1).min(len - 1);
+                self.rules_editor.provider_idx = (self.rules_editor.provider_idx + 1).min(len - 1);
             }
             KeyCode::Char(' ') => {
                 let selected = &mut self.rules_editor.providers[self.rules_editor.provider_idx];
@@ -1413,7 +1405,9 @@ impl App {
 
     fn add_rule_draft(&mut self) {
         let idx = self.rules_editor.idx;
-        self.rules_editor.rules.insert(idx + 1, RuleDraft::default());
+        self.rules_editor
+            .rules
+            .insert(idx + 1, RuleDraft::default());
         self.rules_editor.idx = idx + 1;
         self.rules_editor.field = RulesTextField::Name;
         self.rules_editor.input = TextInput::new(String::new());

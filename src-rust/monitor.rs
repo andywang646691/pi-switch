@@ -491,13 +491,19 @@ mod tests {
             None,
             vec![],
         );
-        assert_eq!(providers_of(&extract_chains(&config)), vec![vec!["a", "b"], vec!["c"]]);
+        assert_eq!(
+            providers_of(&extract_chains(&config)),
+            vec![vec!["a", "b"], vec!["c"]]
+        );
     }
 
     #[test]
     fn extract_chains_falls_back_to_legacy_failover_then_target() {
         let via_failover = config_with(vec![], Some(vec!["a", "b"]), None, vec![]);
-        assert_eq!(providers_of(&extract_chains(&via_failover)), vec![vec!["a", "b"]]);
+        assert_eq!(
+            providers_of(&extract_chains(&via_failover)),
+            vec![vec!["a", "b"]]
+        );
 
         let via_target = config_with(vec![], None, Some("a"), vec![]);
         assert_eq!(providers_of(&extract_chains(&via_target)), vec![vec!["a"]]);
@@ -587,15 +593,38 @@ mod tests {
     #[test]
     fn extract_chains_keeps_rule_match_per_chain() {
         let config = config_with(
-            vec![(vec!["gpt-"], vec!["a", "b"]), (vec!["claude"], vec!["a", "b"])],
+            vec![
+                (vec!["gpt-"], vec!["a", "b"]),
+                (vec!["claude"], vec!["a", "b"]),
+            ],
             None,
             None,
             vec![],
         );
         let chains = extract_chains(&config);
-        assert_eq!(chains.len(), 2, "same providers, different match = distinct chains");
-        assert_eq!(chains[0].rule_match.as_ref().unwrap().model_prefix.as_deref(), Some("gpt-"));
-        assert_eq!(chains[1].rule_match.as_ref().unwrap().model_prefix.as_deref(), Some("claude"));
+        assert_eq!(
+            chains.len(),
+            2,
+            "same providers, different match = distinct chains"
+        );
+        assert_eq!(
+            chains[0]
+                .rule_match
+                .as_ref()
+                .unwrap()
+                .model_prefix
+                .as_deref(),
+            Some("gpt-")
+        );
+        assert_eq!(
+            chains[1]
+                .rule_match
+                .as_ref()
+                .unwrap()
+                .model_prefix
+                .as_deref(),
+            Some("claude")
+        );
     }
 
     #[test]
@@ -683,7 +712,10 @@ mod tests {
         );
         let circuit = CircuitStateStore::default();
         let rule = &config.settings.proxy.rules[0].r#match;
-        assert_eq!(node_unserviceable(&config, "mapped", Some(rule), &circuit), None);
+        assert_eq!(
+            node_unserviceable(&config, "mapped", Some(rule), &circuit),
+            None
+        );
         assert_eq!(
             node_unserviceable(&config, "wrong-api", Some(rule), &circuit),
             Some(UnserviceableReason::Config)
@@ -826,7 +858,10 @@ mod tests {
         // 恢复事件只记录真正发生恢复的节点 (本 tick 产生的最后一行: a 恢复, b 保持熔断)。
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         let last = log.lines().last().unwrap_or_default();
-        assert!(last.contains("\"provider\":\"a\""), "last recovery event: {last}");
+        assert!(
+            last.contains("\"provider\":\"a\""),
+            "last recovery event: {last}"
+        );
         assert!(!log.contains("\"provider\":\"b\""));
     }
 
