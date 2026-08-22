@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn batch_enrich_covers_sentinel_default_and_explicit_entries() {
         let catalog = catalog_with(sample_db());
-        let mut entries = vec![
+        let mut entries = [
             // CLI sentinel shape (add_provider).
             ModelEntry {
                 id: "gpt-5.6-luna".into(),

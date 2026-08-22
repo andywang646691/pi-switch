@@ -619,7 +619,7 @@ pub(super) fn render_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )));
         let mut providers: Vec<_> = stats.by_provider.iter().collect();
-        providers.sort_by(|a, b| b.1.total.cmp(&a.1.total));
+        providers.sort_by_key(|(_, ps)| std::cmp::Reverse(ps.total));
         for (name, ps) in providers {
             let rate = if ps.total > 0 {
                 format!("{:.0}%", (ps.ok as f64 / ps.total as f64) * 100.0)
@@ -641,7 +641,7 @@ pub(super) fn render_stats(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )));
         let mut models: Vec<_> = stats.by_model.iter().collect();
-        models.sort_by(|a, b| b.1.total.cmp(&a.1.total));
+        models.sort_by_key(|(_, ms)| std::cmp::Reverse(ms.total));
         for (name, ms) in models {
             detail_lines.push(Line::from(format!(
                 "    {}: {} req, {} ok",
