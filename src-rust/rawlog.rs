@@ -251,7 +251,10 @@ fn is_skippable_header(name: &str) -> bool {
 /// verbatim — masked in captures (scheme kept, value redacted).
 fn mask_header_value(name: &str, value: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    if matches!(lower.as_str(), "authorization" | "x-api-key" | "cookie" | "set-cookie") {
+    if matches!(
+        lower.as_str(),
+        "authorization" | "x-api-key" | "cookie" | "set-cookie"
+    ) {
         match value.split_whitespace().next() {
             Some(scheme) if !scheme.eq_ignore_ascii_case("cookie") => format!("{scheme} ***"),
             _ => "***".to_string(),
@@ -278,7 +281,10 @@ pub fn capture_request_headers(headers: &axum::http::HeaderMap) -> Vec<(String, 
         .filter(|(name, _)| !is_skippable_header(name.as_str()))
         .map(|(name, value)| {
             let value = value.to_str().unwrap_or_default().to_string();
-            (name.as_str().to_string(), mask_header_value(name.as_str(), &value))
+            (
+                name.as_str().to_string(),
+                mask_header_value(name.as_str(), &value),
+            )
         })
         .collect()
 }
@@ -291,7 +297,10 @@ pub fn capture_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(St
         .filter(|(name, _)| !is_skippable_header(name.as_str()))
         .map(|(name, value)| {
             let value = value.to_str().unwrap_or_default().to_string();
-            (name.as_str().to_string(), mask_header_value(name.as_str(), &value))
+            (
+                name.as_str().to_string(),
+                mask_header_value(name.as_str(), &value),
+            )
         })
         .collect()
 }

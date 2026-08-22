@@ -65,7 +65,9 @@ pub fn set_rules(rules: Vec<crate::config::FailoverRule>) -> Result<Option<PathB
                 )));
             }
             if let Some(profile_value) = config.profiles.get(name) {
-                if let Ok(profile) = serde_json::from_value::<ProviderProfile>(profile_value.clone()) {
+                if let Ok(profile) =
+                    serde_json::from_value::<ProviderProfile>(profile_value.clone())
+                {
                     if profile.proxy {
                         return Err(AppError::Message(format!(
                             "Cannot use proxy profile '{}' as rule provider",
@@ -181,15 +183,10 @@ pub fn update_provider_models(
     name: &str,
     models: Vec<config::ModelEntry>,
 ) -> Result<Option<PathBuf>> {
-    // Enrich entries that may still carry the default window signature (e.g. web UI
-    // defaults) from the opencode model catalog; explicit params are left untouched.
-    let models: Vec<config::ModelEntry> = models
-        .into_iter()
-        .map(|mut m| {
-            crate::models::enrich_entry(&mut m);
-            m
-        })
-        .collect();
+    // Enrich from the latest models.dev data (cache fallback when offline);
+    // entries with an explicit non-default contextWindow are left untouched.
+    let mut models = models;
+    crate::models::enrich_entries_fresh(&mut models);
 
     let mut config = load_config()?;
     let backup = backup_config("config")?;
@@ -221,11 +218,9 @@ pub fn upsert_profile(
     rename_from: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let mut profile = profile.clone();
-    // Enrich entries that may still carry the default window signature (e.g. web UI
-    // defaults) from the opencode model catalog; explicit params are left untouched.
-    for model in &mut profile.models {
-        crate::models::enrich_entry(model);
-    }
+    // Enrich from the latest models.dev data (cache fallback when offline);
+    // explicit params are left untouched.
+    crate::models::enrich_entries_fresh(&mut profile.models);
 
     config::validate_provider_profile(name, &profile).map_err(AppError::InvalidInput)?;
 
@@ -323,8 +318,7 @@ pub async fn test_provider(name: &str) -> Result<TestResult> {
     // with their default UA.
     let global_spoof = config.settings.proxy.user_agent.as_deref();
     let effective_spoof = profile.spoof.as_deref().or(global_spoof);
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
     if let Some(spoof) = effective_spoof {
         builder = builder.user_agent(crate::proxy::resolve_user_agent(spoof));
     }
@@ -431,8 +425,7 @@ pub async fn fetch_models(name: &str) -> Result<Vec<String>> {
     // path — UA-gated upstreams (e.g. ai.centos.hk) reject plain reqwest clients.
     let global_spoof = config.settings.proxy.user_agent.as_deref();
     let effective_spoof = profile.spoof.as_deref().or(global_spoof);
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
     if let Some(spoof) = effective_spoof {
         builder = builder.user_agent(crate::proxy::resolve_user_agent(spoof));
     }
@@ -566,10 +559,7 @@ pub fn sync_gateway_to_pi() -> Result<()> {
                     .unwrap_or_else(|| serde_json::json!({}));
                 if let Some(obj) = compat.as_object_mut() {
                     if !obj.contains_key("supportsDeveloperRole") {
-                        obj.insert(
-                            "supportsDeveloperRole".into(),
-                            serde_json::json!(false),
-                        );
+                        obj.insert("supportsDeveloperRole".into(), serde_json::json!(false));
                     }
                 }
                 entry.compat = Some(compat);

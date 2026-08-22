@@ -8,6 +8,11 @@
 //! The database is cached at `~/.pi-switch/models-cache.json` and refreshed when it is
 //! older than [`CACHE_TTL`]. If the network is unavailable the stale cache (or an empty
 //! catalog) is used, degrading gracefully to pi defaults.
+//!
+//! Write paths that add or update provider models (`add_provider`, `upsert_profile`,
+//! `update_provider_models`) force a network refresh first via [`ModelCatalog::load_fresh`]
+//! so newly added entries pick up freshly published metadata, falling back to the cached
+//! copy when models.dev is unreachable.
 
 use crate::config::{ModelCost, ModelEntry};
 use serde_json::Value;
@@ -18,6 +23,10 @@ use std::time::Duration;
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 pub const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Shorter budget for interactive write paths (add/update provider models): a user
+/// saving a profile shouldn't stare at a blocked UI for a full minute when models.dev
+/// is unreachable — fail fast and fall back to the cached catalog instead.
+const FRESH_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Canonical providers preferred when the same bare model id exists under several
 /// providers (e.g. `gpt-5.6-luna` under openai, vivgrid, azure, ...).
@@ -64,12 +73,9 @@ impl ModelCatalog {
             }
         }
 
-        match fetch_models_dev() {
+        match fetch_models_dev(FETCH_TIMEOUT) {
             Ok(data) => {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&path, serde_json::to_vec(&data).unwrap_or_default());
+                store_cache(&data);
                 Self { data: Some(data) }
             }
             Err(err) => {
@@ -84,6 +90,30 @@ impl ModelCatalog {
                     MODELS_DEV_URL, err
                 );
                 Self { data: None }
+            }
+        }
+    }
+
+    /// Load with a forced network refresh: always try models.dev first regardless of
+    /// cache age, storing the fresh copy; on failure fall back to the cached catalog
+    /// (any age), then to an empty catalog. Used by write paths that add or update
+    /// provider models so new entries get the latest published metadata.
+    pub fn load_fresh() -> Self {
+        match fetch_models_dev(FRESH_FETCH_TIMEOUT) {
+            Ok(data) => {
+                store_cache(&data);
+                Self { data: Some(data) }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[pi-switch] warning: refresh of model catalog from {} failed ({}); \
+                     falling back to cached data",
+                    MODELS_DEV_URL, err
+                );
+                match read_json(&cache_path()) {
+                    Some(data) => Self { data: Some(data) },
+                    None => Self { data: None },
+                }
             }
         }
     }
@@ -286,7 +316,9 @@ impl ModelCatalog {
                 meta = self.lookup(rest);
             }
         }
-        let Some(meta) = meta else { return false; };
+        let Some(meta) = meta else {
+            return false;
+        };
         let Some(map) = thinking_level_map_from_meta(meta) else {
             return false;
         };
@@ -297,7 +329,7 @@ impl ModelCatalog {
 
 /// pi-switch's generic placeholder signature — entries that still look like this are
 /// treated as "unparameterized" and eligible for catalog enrichment. Only used by
-/// tests now that `enrich_entry` covers the same case for all write paths.
+/// tests now that [`enrich_entries_fresh`] covers the same case for all write paths.
 #[cfg(test)]
 pub fn is_unparameterized(entry: &ModelEntry) -> bool {
     has_default_window(entry) && entry.cost.is_none()
@@ -319,8 +351,15 @@ pub fn has_default_window(entry: &ModelEntry) -> bool {
 /// window signature are reset so catalog values fill context window, max output
 /// tokens and input modalities too (not just cost/name/reasoning). Explicit
 /// non-default values always win and are left untouched.
-pub fn enrich_entry(entry: &mut ModelEntry) {
-    enrich_entry_with(entry, catalog());
+/// Enrich model entries on write paths that create or update models (add provider,
+/// upsert, update models): always fetch the latest models.dev data first, falling back
+/// to the on-disk cache when the network is unreachable. Explicit non-default values
+/// always win. One fetch per call — pass the whole batch, don't loop per entry.
+pub fn enrich_entries_fresh(entries: &mut [ModelEntry]) {
+    let catalog = ModelCatalog::load_fresh();
+    for entry in entries.iter_mut() {
+        enrich_entry_with(entry, &catalog);
+    }
 }
 
 fn enrich_entry_with(entry: &mut ModelEntry, catalog: &ModelCatalog) {
@@ -347,14 +386,23 @@ fn file_age(path: &Path) -> Option<Duration> {
     std::time::SystemTime::now().duration_since(modified).ok()
 }
 
+/// Store the catalog data in the on-disk cache (best-effort; failures ignored).
+fn store_cache(data: &Value) {
+    let path = cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_vec(data).unwrap_or_default());
+}
+
 fn read_json(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-fn fetch_models_dev() -> Result<Value, String> {
+fn fetch_models_dev(timeout: Duration) -> Result<Value, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(FETCH_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
@@ -476,6 +524,46 @@ mod tests {
         assert_eq!(entry.max_tokens, 0);
         assert_eq!(entry.input, vec!["text", "image"]);
         assert_eq!(entry.cost.expect("cost").input, 5.0);
+    }
+
+    #[test]
+    fn batch_enrich_covers_sentinel_default_and_explicit_entries() {
+        let catalog = catalog_with(sample_db());
+        let mut entries = vec![
+            // CLI sentinel shape (add_provider).
+            ModelEntry {
+                id: "gpt-5.6-luna".into(),
+                input: Vec::new(),
+                context_window: 0,
+                max_tokens: 0,
+                ..Default::default()
+            },
+            // Web UI default signature.
+            ModelEntry {
+                id: "gpt-5.6-luna".into(),
+                input: vec!["text".into()],
+                context_window: 128000,
+                max_tokens: 16384,
+                ..Default::default()
+            },
+            // Explicit values must survive untouched.
+            ModelEntry {
+                id: "gpt-5.6-luna".into(),
+                input: vec!["text".into()],
+                context_window: 200000,
+                max_tokens: 8192,
+                ..Default::default()
+            },
+        ];
+        for entry in entries.iter_mut() {
+            super::enrich_entry_with(entry, &catalog);
+        }
+        assert_eq!(entries[0].context_window, 1050000);
+        assert_eq!(entries[0].input, vec!["text", "image"]);
+        assert_eq!(entries[1].context_window, 1050000);
+        assert_eq!(entries[1].max_tokens, 128000);
+        assert_eq!(entries[2].context_window, 200000);
+        assert_eq!(entries[2].max_tokens, 8192);
     }
 
     #[test]

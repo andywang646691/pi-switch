@@ -94,7 +94,7 @@ pub fn add_provider(opts: AddProviderOptions) -> napi::Result<AddResult> {
         return Err(napi::Error::from_reason("profile name required"));
     }
 
-    let mut profile = if let Some(ref preset_id) = opts.preset {
+    let profile = if let Some(ref preset_id) = opts.preset {
         let preset = get_preset(preset_id)
             .ok_or_else(|| napi::Error::from_reason(format!("unknown preset '{}'", preset_id)))?;
         let models = opts.models.map(|ids| {
@@ -147,21 +147,9 @@ pub fn add_provider(opts: AddProviderOptions) -> napi::Result<AddResult> {
         }
     };
 
-    // Enrich model metadata from the opencode public model database (models.dev).
-    let catalog = crate::models::catalog();
-    for model in &mut profile.models {
-        catalog.enrich(model);
-        // Fall back to pi defaults for fields the catalog could not fill.
-        if model.input.is_empty() {
-            model.input = vec!["text".to_string()];
-        }
-        if model.context_window == 0 {
-            model.context_window = 128000;
-        }
-        if model.max_tokens == 0 {
-            model.max_tokens = 16384;
-        }
-    }
+    // Model metadata (contextWindow/maxTokens/…) is filled from the latest models.dev
+    // data by ops::upsert_profile below (cache fallback when offline); entries are built
+    // with unset sentinels so catalog values win over pi defaults.
 
     let backup = ops::upsert_profile(&name, &profile, None)
         .map_err(|e| napi::Error::from_reason(e.to_string()))?
@@ -566,30 +554,17 @@ pub struct ModelEntryInput {
 
 #[napi]
 pub fn update_provider_models(name: String, models: Vec<ModelEntryInput>) -> napi::Result<String> {
-    let catalog = crate::models::catalog();
+    // Entries are built with unset sentinels; enrichment (latest models.dev data,
+    // cache fallback, explicit values win) happens in ops::update_provider_models.
     let model_entries: Vec<config::ModelEntry> = models
         .into_iter()
-        .map(|m| {
-            let mut entry = config::ModelEntry {
-                id: m.id,
-                name: m.name,
-                input: m.input.unwrap_or_default(),
-                context_window: m.context_window.unwrap_or(0),
-                max_tokens: m.max_tokens.unwrap_or(0),
-                ..Default::default()
-            };
-            // Fill unset fields from the opencode model catalog; explicit values win.
-            catalog.enrich(&mut entry);
-            if entry.input.is_empty() {
-                entry.input = vec!["text".to_string()];
-            }
-            if entry.context_window == 0 {
-                entry.context_window = 128000;
-            }
-            if entry.max_tokens == 0 {
-                entry.max_tokens = 16384;
-            }
-            entry
+        .map(|m| config::ModelEntry {
+            id: m.id,
+            name: m.name,
+            input: m.input.unwrap_or_default(),
+            context_window: m.context_window.unwrap_or(0),
+            max_tokens: m.max_tokens.unwrap_or(0),
+            ..Default::default()
         })
         .collect();
 
